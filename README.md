@@ -58,7 +58,7 @@ flowchart LR
 **You need:** Node.js 20 or 22, a paid Solana RPC with websockets (e.g. Helius), and a **dedicated burner wallet** holding only what you're willing to trade.
 
 ```bash
-# 1. Get the code (private repo: sign in to GitHub, or unzip a release onto the server)
+# 1. Get the code
 git clone https://github.com/Maxim-Karpov/solana-copy-trading-bot.git
 cd solana-copy-trading-bot
 npm install
