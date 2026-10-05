@@ -1,0 +1,21 @@
+// Jito ShredStream proxy service: the de-facto standard for "decoded /
+// deserialized shreds" over gRPC (Jito's shredstream-proxy, RPC Fast, and
+// other providers serve it). Trimmed from jito-labs/mev-protos
+// shredstream.proto to the part a subscriber needs.
+syntax = "proto3";
+
+package shredstream;
+
+service ShredstreamProxy {
+  rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream Entry);
+}
+
+message SubscribeEntriesRequest {}
+
+message Entry {
+  // the slot that the entry is from
+  uint64 slot = 1;
+  // Serialized bytes of Vec<Entry> (bincode): each entry is
+  // num_hashes u64, hash [32], Vec<VersionedTransaction>
+  bytes entries = 2;
+}

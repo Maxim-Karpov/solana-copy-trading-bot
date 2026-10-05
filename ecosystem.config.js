@@ -1,0 +1,31 @@
+// ecosystem.config.js — settings for running the bot under pm2 on a server.
+//   Start:   pm2 start ecosystem.config.js
+//   Logs:    pm2 logs copybot
+//   Status:  pm2 status
+module.exports = {
+  apps: [
+    {
+      name: 'copybot',
+      script: 'src/index.js',
+      cwd: __dirname,
+
+      // Restart automatically if the bot crashes...
+      autorestart: true,
+      // ...but NOT after a clean exit (exit code 0), which is what Telegram
+      // /stop does. Otherwise pm2 would start it straight back up.
+      stop_exit_codes: [0],
+      // Give up after 15 crashes in a row that each happen within 10s of
+      // starting (e.g. a bad .env value), instead of looping forever.
+      max_restarts: 15,
+      min_uptime: 10000,
+
+      // `pm2 stop/restart` sends Ctrl+C (SIGINT); the bot then finishes any
+      // buy/sell in progress, for up to 30s. pm2's default is to force-kill
+      // after 1.6s, so give it 35s.
+      kill_timeout: 35000,
+
+      // Safety net against a memory leak.
+      max_memory_restart: '800M'
+    }
+  ]
+};
