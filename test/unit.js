@@ -1334,6 +1334,138 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(why(tx(500), null) === null, 'no filters: anything goes');
   });
 
+  await test('hand-built buys: fast curve test and address derivation agree with web3.js', async () => {
+    const crypto = require('crypto');
+    const raw = require(src('pumpBuyRaw.js'));
+    let bad = 0;
+    for (let i = 0; i < 3000; i++) {
+      const b = crypto.randomBytes(32);
+      if (raw.isOnCurve(b) !== PublicKey.isOnCurve(b)) bad += 1;
+    }
+    // Edge cases: y = 0, y = 1 (x = 0) with and without the sign bit, y >= p.
+    const le = (n, sign = false) => { const h = n.toString(16).padStart(64, '0'); const b = Buffer.from(h, 'hex').reverse(); if (sign) b[31] |= 0x80; return b; };
+    const P = 2n ** 255n - 19n;
+    for (const [n, sign] of [[0n, false], [1n, false], [1n, true], [P - 1n, false], [P, false], [P + 5n, false], [P - 1n, true]]) {
+      const b = le(n, sign);
+      if (raw.isOnCurve(b) !== PublicKey.isOnCurve(b)) bad += 1;
+    }
+    check(bad === 0, `same on-curve answer as web3.js (${bad} differ)`);
+    const ATA = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+    const T22 = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb').toBuffer();
+    let diff = 0;
+    for (let i = 0; i < 300; i++) {
+      const u = Keypair.generate().publicKey.toBuffer();
+      const m = Keypair.generate().publicKey.toBuffer();
+      if (!raw.derive([u, T22, m], ATA.toBuffer()).equals(PublicKey.findProgramAddressSync([u, T22, m], ATA)[0].toBuffer())) diff += 1;
+    }
+    check(diff === 0, `same addresses as findProgramAddressSync (${diff} differ)`);
+  });
+
+  for (const via of ['sender', 'jito']) {
+    await test(`hand-built buys (${via}): byte-identical to the SDK route, sent through buyToken, switched off if the layout changes`, async () => {
+      const script = `
+        Math.random = () => 0; // the same random picks on both routes
+        const BN = require('bn.js');
+        const crypto = require('crypto');
+        const { PublicKey, Keypair, VersionedTransaction } = require('@solana/web3.js');
+        const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync } = require('@solana/spl-token');
+        const bs58 = require('bs58').default || require('bs58');
+        const sdk = require('@pump-fun/pump-sdk');
+        const feeRecipient = Keypair.generate().publicKey, reserved = Keypair.generate().publicKey;
+        const pumpGlobal = {
+          initialVirtualTokenReserves: new BN('1073000000000000'), initialVirtualSolReserves: new BN('30000000000'),
+          initialRealTokenReserves: new BN('793100000000000'), tokenTotalSupply: new BN('1000000000000000'),
+          feeBasisPoints: new BN(95), creatorFeeBasisPoints: new BN(30), creatorFeeConfigurable: false, mayhemModeEnabled: false,
+          feeRecipient, feeRecipients: [Keypair.generate().publicKey], reservedFeeRecipient: reserved, reservedFeeRecipients: [reserved]
+        };
+        const tier = { marketCapLamportsThreshold: new BN(0), fees: { lpFeeBps: new BN(0), protocolFeeBps: new BN(95), creatorFeeBps: new BN(30) } };
+        sdk.OnlinePumpSdk.prototype.fetchFeeConfig = async () => ({ feeTiers: [tier], stableFeeTiers: [], flatFees: tier.fees, exoticFlatFees: tier.fees });
+        const sent = [];
+        globalThis.fetch = async (url, opts) => {
+          const body = JSON.parse(opts.body);
+          sent.push({ url: String(url), body });
+          const result = body.method === 'sendTransaction' ? (${JSON.stringify(via)} === 'sender' ? bs58.encode(VersionedTransaction.deserialize(Buffer.from(body.params[0], 'base64')).signatures[0]) : 'jitoSig') : 'x';
+          return { ok: true, status: 200, statusText: 'OK', text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, result }) };
+        };
+        const prewarm = require('./src/prewarm');
+        const d = require('./src/pumpfunDirect');
+        const te = require('./src/tradeExecutor');
+        const computeBudget = require('./src/computeBudget');
+        const raw = require('./src/pumpBuyRaw');
+        const slotGuard = require('./src/slotGuard');
+        const config = require('./src/config');
+        const user = new PublicKey(config.PUBLIC_KEY);
+        const vault = sdk.creatorVaultPda(Keypair.generate().publicKey).toBase58();
+        const hintFor = (mint, prog) => { const curve = sdk.bondingCurvePda(mint); return { mint: mint.toBase58(), creatorVault: vault,
+          txKeys: [curve, getAssociatedTokenAddressSync(mint, curve, true, prog), sdk.bondingCurveV2Pda(mint), feeRecipient].map(String) }; };
+        (async () => {
+          prewarm._setForTests({ blockhash: 'GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi', pumpGlobal });
+          await d.warmFeeConfig({});
+          computeBudget._resetForTests();
+          const out = { same: [], practice: null };
+          const fee = te.priorityFeeSol('buy', 0.25);
+          const ceiling = config.PUMPFUN_COMPUTE_UNITS;
+          out.practice = await te.practiceHandBuilt();
+          for (const [prog, guarded, learned] of [[TOKEN_2022_PROGRAM_ID, true, false], [TOKEN_PROGRAM_ID, false, false], [TOKEN_2022_PROGRAM_ID, true, true], [TOKEN_PROGRAM_ID, true, true]]) {
+            const mint = Keypair.generate().publicKey;
+            const guardInstructions = guarded ? [slotGuard.maxSlotInstruction(777000)] : [];
+            if (learned) {
+              const kind = 'buy|' + (guarded ? 'L2TExM+' : '') + 'AToken+6EF8rr|' + (prog.equals(TOKEN_2022_PROGRAM_ID) ? 't22' : 'spl') + '|a18';
+              for (let i = 0; i < 3; i++) { computeBudget.remember('s' + i + kind, kind, ceiling); computeBudget.observe('s' + i + kind, 61000 + i * 1000); }
+            }
+            const base = { connection: { id: 1 }, user, mint: mint.toBase58(), solAmount: 0.25, slippagePct: 20, tipSol: te.handBuiltPlan(fee, ceiling, config.SEND_VIA === 'sender' ? config.SENDER_TIP : config.JITO_TIP).tip ? (config.SEND_VIA === 'sender' ? config.SENDER_TIP : config.JITO_TIP) : 0,
+              computeUnitLimit: ceiling, priorityFeeMicroLamports: fee > 0 ? Math.ceil((fee * 1e9 * 1e6) / ceiling) : 0, fastHint: hintFor(mint, prog), maxMcapSol: 300, minMcapSol: null, guardInstructions };
+            const a = await d.buildPumpfunBuyTx(base);
+            const fitA = computeBudget.fit(a, 'buy', Math.round(fee * 1e9));
+            const sa = te.prepareAndSign(a, { feeSol: fee }).tx.serialize();
+            const b = await d.buildPumpfunBuyTx({ ...base, handBuilt: te.handBuiltPlan(fee, ceiling, base.tipSol) });
+            const sb = te.prepareAndSign(b, { feeSol: fee }).tx.serialize();
+            out.same.push({ hand: !!b.handBuilt, equal: Buffer.from(sa).equals(Buffer.from(sb)), learned: fitA.learned, kindMatch: b.compute && b.compute.kind === fitA.kind && b.compute.limit === fitA.limit && b.compute.learned === fitA.learned, guard: b.guardIxIndex === a.guardIxIndex });
+          }
+          // Through buyToken, as a copy buy goes.
+          const mint = Keypair.generate().publicKey;
+          const coinFilter = { maxMcapSol: 300, minMcapSol: null, blockedCreators: null };
+          const sig = await te.buyToken({ mint: mint.toBase58(), amountSol: 0.25, slippage: 20, tip: config.JITO_TIP, dex: 'pumpfun', venue: 'pumpfun', pool: 'pump-curve', fastHint: hintFor(mint, TOKEN_2022_PROGRAM_ID), coinFilter });
+          const req = sent.filter((x) => x.body.method === 'sendTransaction').pop();
+          const bytes = ${JSON.stringify(via)} === 'sender' ? Buffer.from(req.body.params[0], 'base64') : Buffer.from(bs58.decode(req.body.params[0]));
+          const tx = VersionedTransaction.deserialize(bytes);
+          const spki = Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), user.toBuffer()]);
+          out.verifies = crypto.verify(null, Buffer.from(tx.message.serialize()), crypto.createPublicKey({ key: spki, format: 'der', type: 'spki' }), Buffer.from(tx.signatures[0]));
+          const keys = tx.message.staticAccountKeys.map(String);
+          const buyIx = tx.message.compiledInstructions.find((ix) => keys[ix.programIdIndex] === '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+          out.exactSolIn = buyIx && Buffer.from(buyIx.data).subarray(0, 8).toString('hex') === '38fc74089edfcd5f' && Buffer.from(buyIx.data).readBigUInt64LE(8) === 250000000n;
+          out.sigMatches = ${JSON.stringify(via)} === 'sender' ? sig === bs58.encode(tx.signatures[0]) : true;
+          out.url = req.url;
+          // A Pump.fun upgrade the SDK knows about but this module doesn't: switched off, SDK route used.
+          const orig = sdk.PUMP_SDK.buyInstructions.bind(sdk.PUMP_SDK);
+          sdk.PUMP_SDK.buyInstructions = async (args) => { const ixs = await orig(args); const last = ixs[ixs.length - 1]; last.keys.push({ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: false }); return ixs; };
+          out.afterChange = await te.practiceHandBuilt();
+          out.disabled = raw.status().disabled;
+          const m2 = Keypair.generate().publicKey;
+          const t2 = await d.buildPumpfunBuyTx({ connection: { id: 1 }, user, mint: m2.toBase58(), solAmount: 0.25, slippagePct: 20, tipSol: 0.001, computeUnitLimit: ceiling, fastHint: hintFor(m2, TOKEN_PROGRAM_ID), maxMcapSol: 300, minMcapSol: null, handBuilt: te.handBuiltPlan(fee, ceiling, 0.001) });
+          out.fallback = !t2.handBuilt && /no lookup/.test(t2.builtFrom || '');
+          console.log(JSON.stringify(out));
+        })().catch((e) => console.log('ERR ' + e.stack));
+      `;
+      const env = { ...process.env, SHRED_FAST_BUY: 'true', MAX_MARKET_CAP_SOL: '300', BUY_PRIORITY_FEE_SOL: '0.0015', PUMPFUN_COMPUTE_UNITS: '130000' };
+      if (via === 'sender') Object.assign(env, { SEND_VIA: 'sender', SENDER_TIP: '0.0016' });
+      else delete env.SEND_VIA;
+      const r = spawnSync(process.execPath, ['-e', script], { cwd: root, env, encoding: 'utf8' });
+      const line = (r.stdout || '').trim().split('\n').filter((l) => l.startsWith('{') || l.startsWith('ERR')).pop() || '';
+      let out = null;
+      try { out = JSON.parse(line); } catch {}
+      check(out, `ran (${(r.stdout || '').slice(-1500)}${(r.stderr || '').slice(-1500)})`);
+      if (!out) return;
+      check(out.practice && out.practice.ok === true, `startup self-check passed (${JSON.stringify(out.practice)})`);
+      check(out.same.length === 4 && out.same.every((x) => x.hand && x.equal && x.kindMatch && x.guard), `same signed bytes as the SDK route, token programs, slot guard, learned limits (${JSON.stringify(out.same)})`);
+      check(out.same[2].learned && out.same[3].learned, 'learned compute limits applied the same way');
+      check(out.verifies && out.exactSolIn && out.sigMatches, `buyToken sent a valid hand-built buy (${JSON.stringify({ v: out.verifies, e: out.exactSolIn, s: out.sigMatches })})`);
+      check(via === 'sender' ? /sender/.test(out.url) : /127\.0\.0\.1:1\/api\/v1\/transactions/.test(out.url), `sent the ${via} way (${out.url})`);
+      check(out.afterChange === null && /layout changed/.test(out.disabled || ''), `a changed layout switches it off (${JSON.stringify(out.afterChange)}, ${out.disabled})`);
+      check(out.fallback, 'then buys use the SDK route');
+    });
+  }
+
   await test('SHRED_FAST_BUY: buy_exact_sol_in built from the shred transaction alone, max market cap enforced on-chain', async () => {
     const script = `
       const BN = require('bn.js');

@@ -88,6 +88,9 @@ async function start() {
     const practice = async () => {
       const ms = await pf.warmUpBuild(rpcPool.getConnection('processed')); // null: not warm, skipped
       if (ms !== null) warmMs = ms;
+      // SHRED_FAST_BUY's hand-built buy: refresh its template, keep it hot,
+      // and check it still matches the SDK's transaction.
+      await require('./tradeExecutor').practiceHandBuilt().catch((err) => warn(`[Prewarm] Hand-built buy check failed: ${err.message}`));
     };
     // A few at startup (the compiler needs several runs to optimise the
     // code); the last one is what a warm build costs. Then one every 30 s.

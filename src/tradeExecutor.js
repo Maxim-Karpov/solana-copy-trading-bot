@@ -37,10 +37,11 @@ const { info, warn } = require('./logger');
 const { withTimeout, fetchJson } = require('./timeouts');
 const pumpRoute = require('./pumpRoute');
 const { buildRaydiumBuyTx, buildRaydiumSellTx, UnsupportedRaydiumTradeError } = require('./raydiumDirect');
-const { prepareForSender, sendViaSender, startKeepAlive } = require('./heliusSender');
+const { prepareForSender, sendViaSender, startKeepAlive, SENDER_TIP_ACCOUNTS } = require('./heliusSender');
 const { buildJupiterBuyTx, buildJupiterSellTx } = require('./jupiterSwap');
 const { EntryPriceTooHighError, CoinFilteredError, checkCoinFilters, needsMcap } = require('./buyQuote');
 const slotGuardMod = require('./slotGuard');
+const { randomTipAccount, JITO_TIP_ACCOUNTS } = require('./jitoTip');
 const SLOT_MS = 400; // Solana's target slot time
 
 const PORTAL_TIMEOUT_MS = 10000;
@@ -111,6 +112,11 @@ class AmbiguousSendError extends Error {
  * for it, otherwise via Jito.
  */
 function prepareAndSign(tx, { feeSol = config.PRIORITY_FEE_SOL } = {}) {
+  if (tx.handBuilt) {
+    // Written for its route already (Sender's tip and fee, or Jito's).
+    tx.sign(walletKeypair);
+    return { tx, viaSender: USE_SENDER, txSignature: bs58.encode(tx.signatures[0]) };
+  }
   let viaSender = false;
   if (USE_SENDER) {
     const prep = prepareForSender(tx, {
@@ -358,13 +364,17 @@ async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, t
         args.maxMcapSol = coinFilter ? coinFilter.maxMcapSol : null;
         args.minMcapSol = coinFilter ? coinFilter.minMcapSol : null;
         args.blockedCreators = coinFilter ? coinFilter.blockedCreators : null;
+        if (config.HAND_BUILT_BUYS) args.handBuilt = handBuiltPlan(feeSol, cuLimit, args.tipSol);
       }
       if (guardInstructions && guardInstructions.length) args.guardInstructions = guardInstructions;
     } else args.tokenAmountUi = amountTokens;
     const tx = await withTimeout(builder(args), DIRECT_BUILD_TIMEOUT_MS, `Direct ${label} build`);
-    // AUTO_COMPUTE_UNITS: the limit this kind of trade really needs.
-    const fitted = computeBudget.fit(tx, side, Math.round(feeSol * 1e9));
-    tx.compute = { ...fitted, feeSol };
+    // AUTO_COMPUTE_UNITS: the limit this kind of trade really needs (a
+    // hand-built buy was sized as it was written).
+    if (!tx.handBuilt) {
+      const fitted = computeBudget.fit(tx, side, Math.round(feeSol * 1e9));
+      tx.compute = { ...fitted, feeSol };
+    }
     return { tx, label: tx.routeLabel || (label === 'Pump.fun' ? 'Pump.fun curve' : label), builtFrom: tx.builtFrom || null }; // e.g. PumpSwap, Raydium LaunchLab
   } catch (err) {
     const unsupported = isUnsupported(err);
@@ -572,6 +582,144 @@ async function buyToken({ mint, amountSol, slippage, tip, dex, venue, pool = nul
   );
 }
 
+/** What a hand-built buy needs to be written for its route: fee, compute ceiling, Sender or Jito, the tip. */
+function handBuiltPlan(feeSol, ceiling, tipSol) {
+  const tip = USE_SENDER
+    ? { account: SENDER_TIP_ACCOUNTS[Math.floor(Math.random() * SENDER_TIP_ACCOUNTS.length)], lamports: Math.round(config.SENDER_TIP * 1e9) }
+    : tipSol > 0
+      ? { account: randomTipAccount().toBase58(), lamports: Math.round(tipSol * 1e9) }
+      : null;
+  return { feeSol, ceiling, useSender: USE_SENDER, tip };
+}
+
+/**
+ * Practice + self-check for hand-built buys (prewarm.js, every practice
+ * build): refresh the template from the SDK, build the same practice buy
+ * both ways, and compare. Any difference switches hand-built buys off for
+ * the run. Nothing is sent. Returns { ok, handMs, sdkMs } or null.
+ */
+let handCheckLogged = false;
+async function practiceHandBuilt() {
+  if (!config.HAND_BUILT_BUYS || !config.DIRECT_PUMPFUN_SWAP || !config.SHRED_FAST_BUY) return null;
+  const pumpBuyRaw = require('./pumpBuyRaw');
+  if (pumpBuyRaw.status().disabled) return null;
+  const { prepareHandBuilt, buildPumpfunBuyTx } = require('./pumpfunDirect');
+  if (!(await prepareHandBuilt(walletPublicKey))) {
+    if (pumpBuyRaw.status().disabled && !handCheckLogged) {
+      handCheckLogged = true;
+      warn(`[tradeExecutor] Hand-built Pump.fun buys are off: ${pumpBuyRaw.status().disabled}. Buys use Pump.fun's SDK instead.`);
+    }
+    return null;
+  }
+  const result = await compareHandBuilt(buildPumpfunBuyTx, pumpBuyRaw);
+  if (!result) return null;
+  if (!result.ok) {
+    pumpBuyRaw.disable(result.why);
+    warn(`[tradeExecutor] Hand-built Pump.fun buys are off: ${result.why}. Buys use Pump.fun's SDK instead.`);
+  } else if (!handCheckLogged) {
+    handCheckLogged = true;
+    info(
+      `[tradeExecutor] Hand-built Pump.fun buys on (SHRED_FAST_BUY): checked identical to the SDK's; ` +
+        `build+sign ${result.handMs.toFixed(2)} ms vs ${result.sdkMs.toFixed(2)} ms the SDK way.`
+    );
+  }
+  return result;
+}
+
+/** The same practice buy built both ways, compared instruction by instruction. */
+async function compareHandBuilt(buildPumpfunBuyTx, pumpBuyRaw) {
+  const { performance } = require('perf_hooks');
+  const { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID: SPL, TOKEN_2022_PROGRAM_ID: T22 } = require('@solana/spl-token');
+  const sdk = require('@pump-fun/pump-sdk');
+  const prewarm = require('./prewarm');
+  const global = prewarm.pumpGlobal();
+  if (!global || !prewarm.blockhash()) return null;
+  const mint = Keypair.generate().publicKey;
+  const prog = Math.random() < 0.5 ? SPL : T22;
+  const curve = sdk.bondingCurvePda(mint);
+  const fastHint = {
+    mint: mint.toBase58(),
+    creatorVault: sdk.creatorVaultPda(Keypair.generate().publicKey).toBase58(),
+    txKeys: [curve, getAssociatedTokenAddressSync(mint, curve, true, prog), sdk.bondingCurveV2Pda(mint), global.feeRecipient].map((k) => k.toBase58())
+  };
+  const feeSol = priorityFeeSol('buy', 0.01);
+  const ceiling = PUMPFUN_CU_LIMIT;
+  const guardInstructions = [slotGuardMod.maxSlotInstruction(123456789)];
+  const base = {
+    connection: getDirectConnection(),
+    user: walletPublicKey,
+    mint: mint.toBase58(),
+    solAmount: 0.01,
+    slippagePct: 20,
+    tipSol: effectiveTip(config.JITO_TIP),
+    computeUnitLimit: ceiling,
+    priorityFeeMicroLamports: feeSol > 0 ? Math.ceil((feeSol * 1e9 * 1e6) / ceiling) : 0,
+    fastHint,
+    maxMcapSol: 1000,
+    minMcapSol: null,
+    guardInstructions
+  };
+  // The SDK route, as a real buy goes: build, size, Sender's preparation.
+  const t0 = performance.now();
+  const sdkTx = await buildPumpfunBuyTx(base);
+  if (!/no lookup/.test(sdkTx.builtFrom || '')) return { ok: false, why: 'the practice buy did not take the no-lookup route' };
+  computeBudget.fit(sdkTx, 'buy', Math.round(feeSol * 1e9));
+  const sdkSigned = prepareAndSign(sdkTx, { feeSol }).tx;
+  sdkSigned.serialize();
+  const t1 = performance.now();
+  const handTx = await buildPumpfunBuyTx({ ...base, handBuilt: handBuiltPlan(feeSol, ceiling, base.tipSol) });
+  if (!handTx.handBuilt) return { ok: false, why: `the practice buy wasn't hand-built (${handTx.builtFrom || 'SDK route'})` };
+  const { tx: handSigned } = prepareAndSign(handTx, { feeSol });
+  const raw = handSigned.serialize();
+  const t2 = performance.now();
+  // Compare what each transaction does.
+  let handParsed;
+  try {
+    handParsed = VersionedTransaction.deserialize(raw);
+  } catch (err) {
+    return { ok: false, why: `the hand-built transaction can't be read back (${err.message})` };
+  }
+  const spki = Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), walletPublicKey.toBuffer()]);
+  const pub = require('crypto').createPublicKey({ key: spki, format: 'der', type: 'spki' });
+  if (!require('crypto').verify(null, Buffer.from(handParsed.message.serialize()), pub, Buffer.from(handParsed.signatures[0]))) {
+    return { ok: false, why: 'the hand-built signature does not verify' };
+  }
+  const recipients = new Set(require('./pumpfunDirect').recipientsOf(global).normal);
+  const tips = new Set((USE_SENDER ? SENDER_TIP_ACCOUNTS : JITO_TIP_ACCOUNTS).map(String));
+  const a = describeForCompare(sdkSigned, recipients, tips);
+  const b = describeForCompare(handParsed, recipients, tips);
+  if (a !== b) return { ok: false, why: `it differs from the SDK's transaction (${firstDifference(a, b)})` };
+  return { ok: true, sdkMs: t1 - t0, handMs: t2 - t1 };
+}
+
+/** Instructions as text (program, accounts with signer/writable flags, data), random picks normalised. */
+function describeForCompare(tx, recipients, tips) {
+  const msg = tx.message;
+  const keys = msg.staticAccountKeys.map((k) => k.toBase58());
+  const flag = (i) => `${msg.isAccountSigner(i) ? 's' : '-'}${msg.isAccountWritable(i) ? 'w' : '-'}`;
+  return msg.compiledInstructions
+    .map((ix) => {
+      const program = keys[ix.programIdIndex];
+      const accounts = ix.accountKeyIndexes.map((i, pos) => {
+        let k = keys[i];
+        if (program === '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P' && pos === 1 && recipients.has(k)) k = 'FEE_RECIPIENT';
+        if (program === '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P' && pos === 17) k = 'BUYBACK_RECIPIENT';
+        if (program === '11111111111111111111111111111111' && pos === 1 && tips.has(k)) k = 'TIP_ACCOUNT';
+        return `${k}:${flag(i)}`;
+      });
+      return `${program}(${accounts.join(',')})${Buffer.from(ix.data).toString('hex')}`;
+    })
+    .join(' | ');
+}
+
+function firstDifference(a, b) {
+  const x = a.split(' | ');
+  const y = b.split(' | ');
+  if (x.length !== y.length) return `${x.length} vs ${y.length} instructions`;
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return `instruction ${i}: ${x[i].slice(0, 120)} vs ${y[i].slice(0, 120)}`;
+  return 'unknown';
+}
+
 function rememberCompute(signature, tx) {
   if (tx && tx.compute) computeBudget.remember(signature, tx.compute.kind, tx.compute.limit, tx.compute.learned);
 }
@@ -705,4 +853,4 @@ module.exports = {
   checkCoinFilters,
   checkEntryPrice,
   _resetForTests: () => { portalDown.until = 0; directUnsupported.clear(); },
-  describePortalError, buyToken, sellToken, signAndSendTx, AmbiguousSendError };
+  describePortalError, buyToken, sellToken, signAndSendTx, prepareAndSign, practiceHandBuilt, compareHandBuilt, handBuiltPlan, AmbiguousSendError };

@@ -38,6 +38,7 @@ const { uiToRaw } = require('./amounts');
 const { info } = require('./logger');
 const quoteTokens = require('./quoteTokens');
 const config = require('./config');
+const pumpBuyRaw = require('./pumpBuyRaw');
 
 class UnsupportedPumpfunTradeError extends Error {}
 
@@ -285,11 +286,28 @@ function tokenProgramFromKeys(mintPk, keySet) {
   return classic ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID;
 }
 
+// Pump.fun's fee recipients, as text and bytes, once per global config.
+const recipientCache = new WeakMap();
+function recipientsOf(global) {
+  let r = recipientCache.get(global);
+  if (!r) {
+    const list = (a, b) => [a, ...(b || [])].filter(Boolean);
+    const normal = list(global.feeRecipient, global.feeRecipients);
+    r = {
+      reserved: list(global.reservedFeeRecipient, global.reservedFeeRecipients).map((k) => k.toBase58()),
+      normal: normal.map((k) => k.toBase58()),
+      normalBytes: [global.feeRecipient, ...(global.feeRecipients || [])].map((k) => k.toBuffer())
+    };
+    recipientCache.set(global, r);
+  }
+  return r;
+}
+
 /** Is it a mayhem-mode coin? From the fee recipient his buy used: true / false / null (can't tell). */
 function mayhemFromKeys(global, keySet) {
-  const list = (a, b) => [a, ...(b || [])].filter(Boolean).map((k) => k.toBase58());
-  if (list(global.reservedFeeRecipient, global.reservedFeeRecipients).some((k) => keySet.has(k))) return true;
-  if (list(global.feeRecipient, global.feeRecipients).some((k) => keySet.has(k))) return false;
+  const r = recipientsOf(global);
+  if (r.reserved.some((k) => keySet.has(k))) return true;
+  if (r.normal.some((k) => keySet.has(k))) return false;
   return null;
 }
 
@@ -298,7 +316,7 @@ function mayhemFromKeys(global, keySet) {
  * buy_exact_sol_in, spending exactly the SOL, with min_tokens_out set from
  * MAX_MARKET_CAP_SOL. Returns { tx } or { reason } (then the normal build).
  */
-async function buildFastBuy({ connection, user, mintPk, solAmount, fastHint, maxMcapSol, minMcapSol, blockedCreators, tipSol, computeUnitLimit, priorityFeeMicroLamports, guardInstructions }) {
+async function buildFastBuy({ connection, user, mintPk, solAmount, fastHint, maxMcapSol, minMcapSol, blockedCreators, tipSol, computeUnitLimit, priorityFeeMicroLamports, guardInstructions, handBuilt = null }) {
   const global = prewarm.pumpGlobal();
   if (!global || !prewarm.blockhash()) return { reason: "Pump.fun's config or a blockhash isn't warm" };
   if (!(maxMcapSol > 0)) return { reason: 'MAX_MARKET_CAP_SOL is not set' };
@@ -309,6 +327,11 @@ async function buildFastBuy({ connection, user, mintPk, solAmount, fastHint, max
   const quoteSeen = quoteTokens.mentionsQuoteMint(fastHint.txKeys);
   if (quoteSeen) return { reason: `his transaction involves ${quoteTokens.label(quoteSeen)}: the coin may be paired to it, which needs the lookup` };
   const keySet = new Set(fastHint.txKeys || []);
+  if (handBuilt && config.HAND_BUILT_BUYS !== false && pumpBuyRaw.ready(user)) {
+    const raw = handBuiltFastBuy({ global, user, mintPk, solAmount, fastHint, keySet, maxMcapSol, blockedCreators, guardInstructions, handBuilt });
+    if (raw.tx || raw.final) return raw;
+    // otherwise (something it doesn't cover): the SDK route below
+  }
   const tokenProgram = tokenProgramFromKeys(mintPk, keySet);
   if (!tokenProgram) return { reason: "the coin's token program isn't clear from his transaction" };
   const mayhem = mayhemFromKeys(global, keySet);
@@ -352,6 +375,46 @@ async function buildFastBuy({ connection, user, mintPk, solAmount, fastHint, max
   }
   attachCoin(tx, { capOnChain: true, creatorBlocked });
   tx.builtFrom = `no lookup (SHRED_FAST_BUY: exact ${solAmount} SOL, at least ${(Number(minOut) / 1e6).toFixed(0)} tokens = market cap ${maxMcapSol} SOL)`;
+  return { tx };
+}
+
+/**
+ * SHRED_FAST_BUY written straight into bytes (pumpBuyRaw.js): same checks
+ * and amounts as the SDK route, a fraction of the time. Returns { tx },
+ * { reason, final: true } (the same answer the SDK route would give), or
+ * { reason } (not covered here: use the SDK route).
+ */
+function handBuiltFastBuy({ global, user, mintPk, solAmount, fastHint, keySet, maxMcapSol, blockedCreators, guardInstructions, handBuilt }) {
+  const mayhem = mayhemFromKeys(global, keySet);
+  if (mayhem !== false) return { final: true, reason: mayhem ? 'mayhem-mode coin (non-standard supply)' : "can't tell from his transaction whether it's a mayhem-mode coin" };
+  const lamports = BigInt(Math.round(solAmount * 1e9));
+  const minOut = minTokensAtMcap(global, lamports, maxMcapSol);
+  if (minOut <= 0n) return { final: true, reason: 'buy too small to set a minimum' };
+  const known = mintCache.get(mintPk.toBase58());
+  const built = pumpBuyRaw.buildBuy({
+    user,
+    mint: fastHint.mint,
+    txKeys: fastHint.txKeys,
+    knownTokenProgram: known ? known.program.toBuffer() : null,
+    creatorVault: fastHint.creatorVault,
+    feeRecipients: recipientsOf(global).normalBytes,
+    lamports,
+    minOut,
+    fees: { feeSol: handBuilt.feeSol, ceiling: handBuilt.ceiling, useSender: handBuilt.useSender },
+    guardInstructions: guardInstructions || [],
+    tip: handBuilt.tip,
+    blockhash: prewarm.blockhash()
+  });
+  if (!built.tx) return { final: /token program/.test(built.reason), reason: built.reason };
+  const { tx } = built;
+  let creatorBlocked = false;
+  if (blockedCreators && blockedCreators.size) {
+    for (const c of blockedCreators) {
+      if (creatorVaultPda(new PublicKey(c)).toBase58() === fastHint.creatorVault) creatorBlocked = true;
+    }
+  }
+  attachCoin(tx, { capOnChain: true, creatorBlocked });
+  tx.builtFrom = `no lookup, hand-built (SHRED_FAST_BUY: exact ${solAmount} SOL, at least ${(Number(minOut) / 1e6).toFixed(0)} tokens = market cap ${maxMcapSol} SOL)`;
   return { tx };
 }
 
@@ -432,13 +495,14 @@ async function buildPumpfunBuyTx({
   fastHint = null,
   maxMcapSol = null,
   minMcapSol = null,
-  blockedCreators = null
+  blockedCreators = null,
+  handBuilt = null // { feeSol, ceiling, useSender, tip }: SHRED_FAST_BUY written straight into bytes
 }) {
   const mintPk = new PublicKey(mint);
   const onlineSdk = onlineSdkFor(connection);
 
   if (fastHint) {
-    const fast = await buildFastBuy({ connection, user, mintPk, solAmount, fastHint, maxMcapSol, minMcapSol, blockedCreators, tipSol, computeUnitLimit, priorityFeeMicroLamports, guardInstructions });
+    const fast = await buildFastBuy({ connection, user, mintPk, solAmount, fastHint, maxMcapSol, minMcapSol, blockedCreators, tipSol, computeUnitLimit, priorityFeeMicroLamports, guardInstructions, handBuilt });
     if (fast.tx) return fast.tx;
     info(`[pumpfunDirect] Not building ${mint} without a lookup (${fast.reason}); looking the coin up.`);
   }
@@ -736,4 +800,38 @@ async function warmUpBuild(connection) {
   return Date.now() - t0;
 }
 
-module.exports = { buildQuoteBuy, quoteBudget, minTokensAtMcap, buildPumpfunBuyTx, buildPumpfunSellTx, UnsupportedPumpfunTradeError, mintTokenProgram, mintDetails, warmFeeConfig, warmUpBuild, onlineSdkFor, curveState, stateFromHint, _resetForTests };
+/**
+ * Make the hand-built buy's template for `user` from the SDK's own
+ * instruction (a practice coin; nothing is sent). Runs with the practice
+ * builds, so the template follows the installed SDK. Returns true if ready.
+ */
+async function prepareHandBuilt(user) {
+  const global = prewarm.pumpGlobal();
+  if (!global) return false;
+  const { Keypair } = require('@solana/web3.js');
+  const mint = Keypair.generate().publicKey;
+  const creator = Keypair.generate().publicKey;
+  const tokenProgram = Math.random() < 0.5 ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID;
+  const ixs = await PUMP_SDK.buyInstructions({
+    global,
+    bondingCurveAccountInfo: null,
+    bondingCurve: { creator, isMayhemMode: false },
+    associatedUserAccountInfo: null,
+    mint,
+    user,
+    amount: new BN(1000),
+    solAmount: new BN(1000),
+    slippage: 0,
+    tokenProgram
+  });
+  const buyIx = ixs[ixs.length - 1];
+  try {
+    pumpBuyRaw.setTemplate({ user, sdkBuyIx: buyIx, mint, tokenProgram, creatorVault: creatorVaultPda(creator) });
+    return true;
+  } catch (err) {
+    pumpBuyRaw.disable(err.message);
+    return false;
+  }
+}
+
+module.exports = { prepareHandBuilt, recipientsOf, buildQuoteBuy, quoteBudget, minTokensAtMcap, buildPumpfunBuyTx, buildPumpfunSellTx, UnsupportedPumpfunTradeError, mintTokenProgram, mintDetails, warmFeeConfig, warmUpBuild, onlineSdkFor, curveState, stateFromHint, _resetForTests };

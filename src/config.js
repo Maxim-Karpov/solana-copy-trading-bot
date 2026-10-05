@@ -246,6 +246,11 @@ const config = {
   // on-chain (required). Falls back to the normal build when something it
   // needs isn't known. Default off.
   SHRED_FAST_BUY: process.env.SHRED_FAST_BUY === 'true',
+  // SHRED_FAST_BUY buys written straight into transaction bytes instead of
+  // through Pump.fun's SDK and web3.js (pumpBuyRaw.js): the same transaction,
+  // checked identical at startup, in a fraction of the time. "false" = the
+  // SDK route.
+  HAND_BUILT_BUYS: (process.env.HAND_BUILT_BUYS || '').trim() !== 'false',
   // Helius feeds (helius-preprocessed shreds and DETECTION_FEED="transaction"):
   // leave out transactions that mention any of these accounts, e.g. a spam
   // program (the [Shreds] summary suggests candidates).

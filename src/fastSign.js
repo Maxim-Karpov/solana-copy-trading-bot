@@ -37,4 +37,4 @@ function signTx(tx, keypair) {
   return tx;
 }
 
-module.exports = { signTx };
+module.exports = { signTx, keyFor };

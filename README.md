@@ -6,8 +6,8 @@
 
 ![Node.js](https://img.shields.io/badge/node-%E2%89%A518.17-339933?logo=node.js&logoColor=white)
 ![Solana](https://img.shields.io/badge/Solana-mainnet-9945FF?logo=solana&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-162%20passing-2ea44f)
-![Version](https://img.shields.io/badge/version-3.27.0-blue)
+![Tests](https://img.shields.io/badge/tests-165%20passing-2ea44f)
+![Version](https://img.shields.io/badge/version-3.28.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Speed](#-built-for-speed) · [Telegram](#-telegram-control) · [Full reference](docs/REFERENCE.md)
@@ -19,7 +19,7 @@
 ## ✨ Highlights
 
 - **Sees trades before they land.** Shred streams (Helius preprocessed, Shreder, Jito gRPC) report the copy wallet's transaction as the slot leader produces it, hundreds of milliseconds before an RPC websocket would. Run two side by side and the bot uses whichever is first and logs which one won.
-- **Builds its own transactions.** Pump.fun, PumpSwap and Raydium swaps are built and signed locally from each program's own SDK, with blockhash and config pre-fetched, so a buy needs at most one network round trip and often none.
+- **Builds its own transactions.** Pump.fun, PumpSwap and Raydium swaps are built and signed locally, with blockhash and config pre-fetched, so a buy needs at most one network round trip and often none. The fastest path writes the Pump.fun buy straight into bytes: about 0.3 ms from decision to signed transaction.
 - **Lands early in the block.** Sends through Helius Sender (Jito plus staked connections) or Jito, sizes compute units from what each kind of trade really used, and can cancel a buy on-chain if it would land too many slots after the copy wallet's.
 - **Exits as fast as it enters.** Mirrors sells proportionally, or sells the instant its own buy lands (`INSTANT_SELL`), with confirmed-only bookkeeping and automatic retries, so no position is forgotten.
 - **Hard risk limits.** Per-trade and total exposure caps, a limit on open positions, a buy cooldown and market-cap filters. Pause buying from Telegram at any time while exits keep working.
@@ -70,7 +70,7 @@ nano .env               # RPC, wallet, copy wallets, mode, limits
 
 # 3. Check and run
 npm run check-env       # missing or misspelt settings (never prints values)
-npm test                # 162 tests, fully simulated, no network or funds
+npm test                # 165 tests, fully simulated, no network or funds
 npm start
 ```
 
@@ -113,6 +113,7 @@ On top of any mode:
 | Shred feeds | `SHRED_SOURCE` | `helius-preprocessed`, `shreder`, `jito-grpc`, or several comma-separated to race them |
 | Feed race | `SHRED_SOURCE="shreder,helius-preprocessed"` | `[Race]` line per trade: who was first and by how many ms |
 | No-lookup buys | `SHRED_FAST_BUY` | Builds Pump.fun buys straight from the shred data, with the price capped on-chain by `MAX_MARKET_CAP_SOL` |
+| Hand-built buys | `HAND_BUILT_BUYS` (on) | Writes those buys straight into transaction bytes: ~0.3 ms to build and sign instead of ~2 ms, checked byte-identical to the SDK's |
 | Sender | `SEND_VIA="sender"`, `SENDER_TIP` | Helius Sender, which sends via Jito and staked connections at once |
 | Buy fees | `BUY_PRIORITY_FEE_SOL` | Higher priority fee for buys racing snipers; sells pay less |
 | Compute budget | `AUTO_COMPUTE_UNITS`, `PUMPFUN_COMPUTE_UNITS` | Learns each trade kind's real usage, so the same fee buys a higher fee per CU |
@@ -169,6 +170,7 @@ src/
 ├── shredDecode.js      Pump.fun / PumpSwap / router trade intents, router learning
 ├── tradeExecutor.js    builds, signs and sends trades
 ├── pumpfunDirect.js    Pump.fun bonding-curve builder
+├── pumpBuyRaw.js       the fast buy written straight into bytes
 ├── pumpswapDirect.js   PumpSwap AMM builder
 ├── raydiumDirect.js    Raydium AMM v4 / CPMM builder
 ├── computeBudget.js    learned compute-unit limits
