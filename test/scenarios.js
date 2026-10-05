@@ -1503,6 +1503,37 @@ module.exports = {
     }
   },
 
+  buy_sent_but_never_saved_is_recovered_after_a_restart: {
+    env: { TRADE_TYPE: 'EXACT', PENDING_FIRST_MS: '100', PENDING_SWEEP_MS: '300', PENDING_BUY_GIVE_UP_MS: '1500' },
+    setup(h) {
+      // A previous run sent three buys and stopped before saving any position:
+      // one landed, one failed on-chain, one never showed up.
+      h.writePositions([]);
+      h.mintLanded = h.newMint();
+      h.mintFailed = h.newMint();
+      h.mintLost = h.newMint();
+      h.ledger.txs.set('LANDEDsig', { state: 'confirmed', mint: h.mintLanded, lamportsDelta: -105000000, tokenDelta: 10n ** 10n });
+      h.ledger.tokens.set(h.mintLanded, 10n ** 10n);
+      h.ledger.txs.set('FAILEDsig', { state: 'failed', err: { InstructionError: [4, 'Custom'] }, mint: h.mintFailed, lamportsDelta: 0, tokenDelta: 0n });
+      const fs = require('fs');
+      const path = require('path');
+      const rec = (signature, mint) => ({ signature, mint, sol: 0.1, at: Date.now(), wallet: h.ledger.wallet, venue: 'pumpfun', dex: 'pumpfun', pool: null, parent: 'copyX', mode: 'EXACT' });
+      fs.writeFileSync(path.join(path.dirname(h.posFile), 'pending-buys.json'), JSON.stringify([rec('LANDEDsig', h.mintLanded), rec('FAILEDsig', h.mintFailed), rec('LOSTsig', h.mintLost)]));
+    },
+    async run(h) {
+      const pos = await h.waitFor(() => h.active().find((p) => p.mint === h.mintLanded), 'the landed buy comes back as a position');
+      h.check(pos.buy_signature === 'LANDEDsig' && pos.needs_reconcile === true, `flagged to read its amount from the wallet (${JSON.stringify({ sig: pos.buy_signature, rec: pos.needs_reconcile })})`);
+      h.check(!h.active().find((p) => p.mint === h.mintFailed || p.mint === h.mintLost), 'the failed and lost ones open nothing');
+      const rec = await h.waitFor(() => h.active().find((p) => p.mint === h.mintLanded && p.needs_reconcile === false), 'amount read from the wallet');
+      h.check(rec.token_amount === '10000.000000', `amount ${rec.token_amount}`);
+      await h.waitFor(() => {
+        try {
+          return JSON.parse(require('fs').readFileSync(require('path').join(require('path').dirname(h.posFile), 'pending-buys.json'), 'utf8')).length === 0;
+        } catch { return false; }
+      }, 'every note cleared (recovered, failed, and the one that never showed up after the wait)', 6000);
+    }
+  },
+
   late_earlier_buy_does_not_reopen_exited_position: {
     env: { TRADE_TYPE: 'EXACT' },
     async run(h) {

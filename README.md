@@ -6,8 +6,8 @@
 
 ![Node.js](https://img.shields.io/badge/node-%E2%89%A518.17-339933?logo=node.js&logoColor=white)
 ![Solana](https://img.shields.io/badge/Solana-mainnet-9945FF?logo=solana&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-171%20passing-2ea44f)
-![Version](https://img.shields.io/badge/version-3.30.1-blue)
+![Tests](https://img.shields.io/badge/tests-172%20passing-2ea44f)
+![Version](https://img.shields.io/badge/version-3.31.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Speed](#-built-for-speed) · [Rust fast path](#-rust-fast-path) · [Telegram](#-telegram-control) · [Full reference](docs/REFERENCE.md)
@@ -70,7 +70,7 @@ nano .env               # RPC, wallet, copy wallets, mode, limits
 
 # 3. Check and run
 npm run check-env       # missing or misspelt settings (never prints values)
-npm test                # 171 tests, fully simulated, no network or funds
+npm test                # 172 tests, fully simulated, no network or funds
 npm start
 ```
 

@@ -105,6 +105,10 @@ function installMocks(rootDir, walletAddress) {
   // ---- tradeExecutor mock ----
   const tradeExecutor = {
     buyTiming: (sig) => ledger.buyTimings.get(sig) || null,
+    // INSTANT_SELL: the coin's state read as the buy goes out.
+    prewarmSell(mint) {
+      ledger.calls.prewarmSell = (ledger.calls.prewarmSell || 0) + 1;
+    },
     // FAST_PATH="rust": a buy the fast path sent, recorded here.
     noteExternalBuy(sig, t) {
       ledger.calls.external = (ledger.calls.external || 0) + 1;

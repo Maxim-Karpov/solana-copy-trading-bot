@@ -145,7 +145,7 @@ async function signAndSendTx(tx, opts = {}) {
   if (viaSender) {
     const raw = Buffer.from(tx.serialize());
     try {
-      return await sendViaSender(raw.toString('base64'));
+      return await sendViaSender(raw.toString('base64'), { hedge: () => sendViaRpcFallback(raw, txSignature) });
     } catch (err) {
       if (err.ambiguous) throw new AmbiguousSendError(err.message, txSignature);
       if (err.rateLimited) return sendViaRpcFallback(raw, txSignature);
@@ -309,7 +309,7 @@ function noteDirectMiss(mint, reason) {
   if (lastDirectMiss.size > 200) lastDirectMiss.delete(lastDirectMiss.keys().next().value);
 }
 
-async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, tip, venue, pool, curveHint = null, guardInstructions = null, fastHint = null, coinFilter = null }) {
+async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, tip, venue, pool, curveHint = null, guardInstructions = null, fastHint = null, coinFilter = null, warm = false }) {
   let builder = null;
   let isUnsupported = null;
   let label = null;
@@ -373,7 +373,10 @@ async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, t
         if (config.HAND_BUILT_BUYS) args.handBuilt = handBuiltPlan(feeSol, cuLimit, args.tipSol);
       }
       if (guardInstructions && guardInstructions.length) args.guardInstructions = guardInstructions;
-    } else args.tokenAmountUi = amountTokens;
+    } else {
+      args.tokenAmountUi = amountTokens;
+      if (warm && label === 'Pump.fun') args.warm = true; // INSTANT_SELL: the state read when the buy went out
+    }
     const tx = await withTimeout(builder(args), DIRECT_BUILD_TIMEOUT_MS, `Direct ${label} build`);
     // AUTO_COMPUTE_UNITS: the limit this kind of trade really needs (a
     // hand-built buy was sized as it was written).
@@ -876,7 +879,20 @@ async function sendDirectBuy(directTx, { mint, amountSol, coinFilter, priceCheck
  * @param dex           - value sent to SolanaPortal
  * @param venue         - where the position's token trades (direct path)
  */
-async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool = null }) {
+/**
+ * INSTANT_SELL: read the coin's state now (as the buy goes out), so the sell
+ * that follows the landing is built without a lookup.
+ */
+function prewarmSell(mint) {
+  if (!config.DIRECT_PUMPFUN_SWAP) return;
+  try {
+    require('./pumpfunDirect').prewarmSell(getDirectConnection(), new PublicKey(mint), walletPublicKey).catch(() => {});
+  } catch {
+    // best effort
+  }
+}
+
+async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool = null, warm = false }) {
   const route = venue || dex;
   info(
     `[tradeExecutor] Placing SELL order: mint=${mint}, tokenAmount=${amountTokens}, ` +
@@ -884,7 +900,7 @@ async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool =
   );
 
   const t0 = Date.now();
-  const directTx = await tryBuildDirect('sell', { mint, amountTokens, slippage, tip, venue: route, pool });
+  const directTx = await tryBuildDirect('sell', { mint, amountTokens, slippage, tip, venue: route, pool, warm });
   if (directTx) {
     const builtMs = Date.now() - t0;
     const qt = directTx.tx.quoteTrade || null;
@@ -900,7 +916,7 @@ async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool =
     rememberCompute(signature, directTx.tx);
     if (qt) quoteTokens.afterTrade(qt.quoteMint);
     info(
-      `[tradeExecutor] SELL txn sent via ${directTx.label} direct (built by the bot in ${builtMs}ms${qt ? `; paid out in ${qt.label}` : ''}${computeText(directTx.tx)}): https://solscan.io/tx/${signature}`
+      `[tradeExecutor] SELL txn sent via ${directTx.label} direct (built by the bot in ${builtMs}ms${directTx.builtFrom ? `, ${directTx.builtFrom}` : ''}${qt ? `; paid out in ${qt.label}` : ''}${computeText(directTx.tx)}): https://solscan.io/tx/${signature}`
     );
     return signature;
   }
@@ -928,6 +944,7 @@ async function buyTokenViaJupiter(mint, amountSol) {
 }
 
 module.exports = {
+  prewarmSell,
   priorityFeeSol,
   quoteTradeOf,
   buyTokenViaJupiter,

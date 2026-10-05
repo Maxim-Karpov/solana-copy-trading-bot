@@ -25,6 +25,7 @@ const copyWallet = Keypair.generate();
 const baseEnv = {
   PATH: process.env.PATH,
   HOME: process.env.HOME,
+  SELL_EXPIRY_MS: '1500',
   SOLANA_RPC: 'http://127.0.0.1:1',
   PRIVATE_KEY: bs58.encode(wallet.secretKey),
   PUBLIC_KEY: wallet.publicKey.toBase58(),

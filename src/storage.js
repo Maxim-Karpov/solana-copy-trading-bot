@@ -24,6 +24,7 @@ const filePath = path.join(__dirname, '../data/positions.json');
 const tmpPath = filePath + '.tmp';
 const archivePath = path.join(path.dirname(filePath), 'positions-closed.jsonl');
 const exitedPath = path.join(path.dirname(filePath), 'exited-mints.txt');
+const pendingBuysPath = path.join(path.dirname(filePath), 'pending-buys.json');
 // Closed positions stay in positions.json this long (the PnL is filled in
 // just after a close) before moving to the archive.
 const ARCHIVE_AFTER_MS = 5 * 60 * 1000;
@@ -281,7 +282,56 @@ function setPaused(paused) {
   writeData(data);
 }
 
+// ---- buys sent but not yet recorded as positions ----
+// If the bot stops between sending a buy and saving its position, the tokens
+// are in the wallet with nothing tracking them. Each sent buy is noted here
+// (one small file, written after the send) and dropped once its position is
+// saved or the buy is known to have failed; whatever is left at the next
+// start (or sweep) is checked on-chain and recovered.
+let pendingBuysCache = null;
+
+function pendingBuys() {
+  if (!pendingBuysCache) {
+    try {
+      const list = JSON.parse(fs.readFileSync(pendingBuysPath, 'utf-8'));
+      pendingBuysCache = Array.isArray(list) ? list : [];
+    } catch {
+      pendingBuysCache = [];
+    }
+  }
+  return pendingBuysCache;
+}
+
+function writePendingBuys() {
+  const tmp = pendingBuysPath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(pendingBuysCache), 'utf-8');
+  fs.renameSync(tmp, pendingBuysPath);
+}
+
+function addPendingBuy(rec) {
+  const list = pendingBuys();
+  if (list.some((r) => r.signature === rec.signature)) return;
+  list.push(rec);
+  if (list.length > 200) list.shift();
+  writePendingBuys();
+}
+
+function removePendingBuy(signature) {
+  const list = pendingBuys();
+  const i = list.findIndex((r) => r.signature === signature);
+  if (i === -1) return;
+  list.splice(i, 1);
+  writePendingBuys();
+}
+
+function getPendingBuys() {
+  return pendingBuys().slice();
+}
+
 module.exports = {
+  addPendingBuy,
+  removePendingBuy,
+  getPendingBuys,
   initStorage,
   getPaused,
   setPaused,

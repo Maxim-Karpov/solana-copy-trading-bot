@@ -30,6 +30,7 @@ console.log = (...args) => {
 };
 
 const h = {
+  posFile,
   ledger,
   logs,
   telegram,

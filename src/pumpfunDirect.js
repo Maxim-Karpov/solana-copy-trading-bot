@@ -109,6 +109,29 @@ function isSolQuote(quoteMint) {
  * program, so for a new coin both possible addresses are asked for and the
  * mint account says which one is real.
  */
+// An instant sell can't wait for a lookup of the coin (~20-40 ms): it's read
+// when the buy goes out and used by the sell that follows. The buy only makes
+// the curve's price rise, so a sell quoted from the state before it lands asks
+// for LESS than the real output (a safe floor), never more.
+const warmSell = new Map(); // mint -> { promise, at }
+const WARM_SELL_MAX_AGE_MS = 15_000;
+
+function prewarmSell(connection, mintPk, user) {
+  const key = mintPk.toBase58();
+  const promise = curveState(connection, mintPk, user);
+  promise.catch(() => warmSell.delete(key));
+  warmSell.set(key, { promise, at: Date.now() });
+  if (warmSell.size > 50) warmSell.delete(warmSell.keys().next().value);
+  return promise;
+}
+
+function takeWarmSell(mintPk) {
+  const key = mintPk.toBase58();
+  const w = warmSell.get(key);
+  warmSell.delete(key); // one sell uses it; any later one reads fresh
+  return w && Date.now() - w.at < WARM_SELL_MAX_AGE_MS ? w.promise : null;
+}
+
 async function curveState(connection, mintPk, user) {
   const key = mintPk.toBase58();
   const curvePk = bondingCurvePda(mintPk);
@@ -604,12 +627,15 @@ async function buildPumpfunSellTx({
   slippagePct,
   tipSol = 0,
   computeUnitLimit = 200_000,
-  priorityFeeMicroLamports = 0
+  priorityFeeMicroLamports = 0,
+  warm = false
 }) {
   const mintPk = new PublicKey(mint);
   const onlineSdk = onlineSdkFor(connection);
 
-  const [global, st, feeConfig] = await Promise.all([globalConfig(onlineSdk), curveState(connection, mintPk, user), currentFeeConfig(onlineSdk)]);
+  const warmed = warm ? takeWarmSell(mintPk) : null;
+  const [global, st, feeConfig] = await Promise.all([globalConfig(onlineSdk), warmed || curveState(connection, mintPk, user), currentFeeConfig(onlineSdk)]);
+
   const { mintInfo, quoteMint, quoteTokenProgram, bondingCurveAccountInfo, bondingCurve } = st;
   const tokenProgram = mintInfo.program;
 
@@ -648,7 +674,9 @@ async function buildPumpfunSellTx({
     cashback: bondingCurve.isCashbackCoin || false
   });
 
-  return assembleV0Tx({ connection, payer: user, instructions, computeUnitLimit, priorityFeeMicroLamports, tipSol });
+  const sellTx = await assembleV0Tx({ connection, payer: user, instructions, computeUnitLimit, priorityFeeMicroLamports, tipSol });
+  if (warmed) sellTx.builtFrom = 'from the coin state read when the buy went out, no lookup';
+  return sellTx;
 }
 
 // ---- coins paired to another token (QUOTE_TOKENS) ----
@@ -846,4 +874,4 @@ async function prepareHandBuilt(user) {
   }
 }
 
-module.exports = { worstFeeBpsFor: worstFeeBps, prepareHandBuilt, recipientsOf, buildQuoteBuy, quoteBudget, minTokensAtMcap, buildPumpfunBuyTx, buildPumpfunSellTx, UnsupportedPumpfunTradeError, mintTokenProgram, mintDetails, warmFeeConfig, warmUpBuild, onlineSdkFor, curveState, stateFromHint, _resetForTests };
+module.exports = { worstFeeBpsFor: worstFeeBps, prepareHandBuilt, recipientsOf, buildQuoteBuy, quoteBudget, minTokensAtMcap, buildPumpfunBuyTx, buildPumpfunSellTx, prewarmSell, UnsupportedPumpfunTradeError, mintTokenProgram, mintDetails, warmFeeConfig, warmUpBuild, onlineSdkFor, curveState, stateFromHint, _resetForTests };

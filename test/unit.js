@@ -3397,7 +3397,7 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     try { out = JSON.parse(line); } catch {}
     check(out && !out.error, `sent (${line || (r.stderr || '').slice(-300)})`);
     if (!out || out.error) return;
-    check(out.senderTries === 2, `Sender tried twice (${out.senderTries})`);
+    check(out.senderTries >= 1, `Sender tried (${out.senderTries}); the RPC send goes out at the first 429, beside the retry`);
     check(out.sameTx && typeof out.sig === 'string' && out.sig.length > 40, 'the RPC got the very same signed transaction');
     check(out.opts && out.opts.skipPreflight === true && out.opts.maxRetries === 0, `sent without preflight or RPC retries (${JSON.stringify(out.opts)})`);
   });

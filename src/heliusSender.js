@@ -205,7 +205,12 @@ function senderUrl(pathSuffix = null) {
 const RATE_LIMIT_RETRY_MS = [60];
 let rateLimited = 0; // count, for the log
 
-async function sendViaSender(signedTxBase64) {
+/**
+ * `hedge`: on the first 429, also start this (the same signed transaction
+ * through the RPC) at once instead of after the retries; whichever sends
+ * first wins (a transaction sent twice lands once).
+ */
+async function sendViaSender(signedTxBase64, { hedge = null } = {}) {
   const body = {
     jsonrpc: '2.0',
     id: '1',
@@ -228,6 +233,18 @@ async function sendViaSender(signedTxBase64) {
     if (res.status !== 429 || attempt >= RATE_LIMIT_RETRY_MS.length) break;
     rateLimited += 1;
     warn(`[Sender] Rate-limited by Helius Sender (429; ${rateLimited} this run); trying once more in ${RATE_LIMIT_RETRY_MS[attempt]}ms.`);
+    if (hedge && attempt === 0) {
+      const hedged = hedge();
+      hedged.catch(() => {});
+      // The Sender retry still waits its pause, but beside the RPC send, not before it.
+      const again = new Promise((r) => setTimeout(r, RATE_LIMIT_RETRY_MS[0])).then(() => sendViaSender(signedTxBase64));
+      try {
+        return await Promise.any([again, hedged]);
+      } catch (agg) {
+        const errs = agg.errors || [];
+        throw errs[1] || errs[0] || agg;
+      }
+    }
     await new Promise((r) => setTimeout(r, RATE_LIMIT_RETRY_MS[attempt]));
   }
   if (res.status === 429) {

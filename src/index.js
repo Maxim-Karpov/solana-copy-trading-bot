@@ -531,6 +531,98 @@ process.on('uncaughtException', (err) => {
       }
     }
 
+    // Buys sent from here whose position isn't saved yet (storage.js: pending-buys.json).
+    const buysInFlight = new Set();
+    function dropPendingBuy(sig) {
+      try {
+        storage.removePendingBuy(sig);
+      } catch (err) {
+        warn(`[Main] Couldn't clear the note of buy ${sig.slice(0, 8)}… (${err.message}).`);
+      }
+    }
+    const PENDING_BUY_GIVE_UP_MS = process.env.PENDING_BUY_GIVE_UP_MS !== undefined ? Number(process.env.PENDING_BUY_GIVE_UP_MS) : 10 * 60_000;
+
+    /**
+     * Buys sent whose position was never saved (the bot stopped in between, or
+     * the buy landed after it gave up waiting): checked on-chain. One that
+     * landed gets a position of its own (its amount read from the wallet);
+     * one that failed is dropped; one that can't be found yet is kept a
+     * while longer.
+     */
+    async function recoverPendingBuys(why) {
+      if (shuttingDown) return 0;
+      let recovered = 0;
+      for (const rec of storage.getPendingBuys()) {
+        if (buysInFlight.has(rec.signature)) continue;
+        const known = storage.getAllPositions().some((p) => p.buy_signature === rec.signature);
+        if (known) {
+          dropPendingBuy(rec.signature);
+          continue;
+        }
+        const st = await signatureStatus(rec.signature);
+        if (buysInFlight.has(rec.signature) || shuttingDown) continue;
+        if (st === 'failed') {
+          dropPendingBuy(rec.signature);
+          continue;
+        }
+        if (st !== 'confirmed') {
+          if (Date.now() - rec.at > PENDING_BUY_GIVE_UP_MS) {
+            warn(`[Main] Buy ${rec.signature.slice(0, 8)}… of ${rec.mint} never showed up on-chain; forgetting it.`);
+            dropPendingBuy(rec.signature);
+          }
+          continue;
+        }
+        recovered += 1;
+        await tracked(() =>
+          runExclusive(rec.mint, async () => {
+            if (storage.getAllPositions().some((p) => p.buy_signature === rec.signature)) return;
+            const current = activeByMint(rec.mint)[0] || null;
+            let note;
+            if (current) {
+              // An add-on to a position we hold: the whole amount is re-read from the wallet.
+              persist(current, { needs_reconcile: true, buy_amount: num(current.buy_amount) + rec.sol, cost_basis_sol: num(current.cost_basis_sol ?? current.buy_amount) + rec.sol, buy_count: num(current.buy_count, 1) + 1 });
+              note = `added to position ${shortId(current.id)}`;
+            } else {
+              const usesTpSl = USES_TP_SL.has(rec.mode);
+              const newPos = storage.addPosition({
+                mint: rec.mint,
+                buy_amount: rec.sol,
+                cost_basis_sol: rec.sol,
+                swap_cost_sol: rec.sol,
+                token_amount: '0',
+                decimals: null,
+                needs_reconcile: true, // its amount comes from the wallet
+                entry_price: 0,
+                current_price: 0,
+                highest_price: 0,
+                trade_mode: rec.mode,
+                parent_signature: rec.parent || null,
+                buy_signature: rec.signature,
+                copy_wallet: rec.wallet,
+                stop_loss_pct: usesTpSl ? config.STOP_LOSS : null,
+                take_profit_pct: usesTpSl ? config.TAKE_PROFIT : null,
+                dex: rec.dex,
+                venue: rec.venue,
+                pool: rec.pool || null,
+                realized_pnl_sol: 0,
+                trailing_stop_distance: config.ENABLE_TRAILING_STOP ? config.TRAILING_STOP_DISTANCE : null,
+                trailing_stop_activation: config.ENABLE_TRAILING_STOP ? config.TRAILING_STOP_ACTIVATION : null,
+                sell_after_at: null
+              });
+              activeMap.set(newPos.id, { ...newPos });
+              stateChanged();
+              note = `new position ${shortId(newPos.id)}`;
+            }
+            const msg = `Buy ${rec.signature.slice(0, 8)}… of ${rec.mint} (${rec.sol} SOL) landed but was never recorded (${why}); recovered as ${note}. Its token amount will be read from the wallet.`;
+            warn(`[Main] ${msg}`);
+            telegramBot.notifyAlert(msg);
+            dropPendingBuy(rec.signature);
+          })
+        ).catch((err) => error(`[Main] Couldn't recover buy ${rec.signature}:`, err.message));
+      }
+      return recovered;
+    }
+
     /** Exact effect of one of our own transactions on our wallet for `mint`, or null. */
     /**
      * Compute units our transaction actually used, next to the budget it set
@@ -750,6 +842,8 @@ process.on('uncaughtException', (err) => {
     // alreadySent { signature, amountRaw, ambiguous }: a sell sent before the
     // position existed (INSTANT_SELL). The first attempt follows it instead
     // of sending another; if it fails, later attempts sell as usual.
+    // A transaction can no longer land once its blockhash is ~150 blocks old (~60 s); this is the margin.
+    const SELL_EXPIRY_MS = process.env.SELL_EXPIRY_MS !== undefined ? Number(process.env.SELL_EXPIRY_MS) : 90_000;
     async function sellWithRetries(pos, desiredRaw, decimals, { full, stopIf = null, trackedKnown = true, alreadySent = null }) {
       // trackedKnown=false: the stored amount is stale (a buy's fill couldn't
       // be read), so a full sell takes the whole on-chain balance.
@@ -757,6 +851,7 @@ process.on('uncaughtException', (err) => {
       let amountRaw = desiredRaw;
       let lastSig = null; // most recent sell tx that might be on-chain
       let maybeLanded = false; // its fate is unknown (not a definite failure)
+      let lastSentAt = 0;
 
       const landed = async (signature, fallbackSoldRaw) => {
         const measured = await measureOwnTx(signature, pos.mint);
@@ -771,6 +866,20 @@ process.on('uncaughtException', (err) => {
 
       for (let attempt = 1; attempt <= config.SELL_MAX_ATTEMPTS; attempt++) {
         try {
+          if (attempt > 1 && !full && lastSig && maybeLanded) {
+            // A partial sell that may still land can't be sent again until it can
+            // no longer land (its blockhash has expired): two of the same %
+            // would sell too much. Looked at every few seconds meanwhile.
+            while (Date.now() - lastSentAt < SELL_EXPIRY_MS) {
+              const st = await signatureStatus(lastSig);
+              if (st === 'confirmed') break; // handled just below
+              if (st === 'failed') {
+                maybeLanded = false;
+                break;
+              }
+              await sleep(Math.min(3000, Math.max(50, SELL_EXPIRY_MS - (Date.now() - lastSentAt))));
+            }
+          }
           if (attempt > 1 || amountRaw <= 0n) {
             if (lastSig && maybeLanded && (await signatureStatus(lastSig)) === 'confirmed') {
               info(`[Main] Earlier sell ${lastSig} did land; not selling again.`);
@@ -822,6 +931,7 @@ process.on('uncaughtException', (err) => {
           }
           lastSig = signature;
           maybeLanded = true;
+          lastSentAt = attempt === 1 && alreadySent && alreadySent.sentAt ? alreadySent.sentAt : Date.now();
 
           // An ambiguous send that never left the bot would otherwise hold the
           // exit for the whole timeout; a sent one confirms within seconds. A
@@ -1211,7 +1321,8 @@ process.on('uncaughtException', (err) => {
           tip: config.JITO_TIP,
           dex,
           venue,
-          pool: pool || null
+          pool: pool || null,
+          warm: true
         });
         info(`[Main] INSTANT_SELL: sell of ${mint} sent ${Date.now() - landedAt}ms after the buy was seen landed: https://solscan.io/tx/${signature}`);
         return { signature, amountRaw: bal.raw };
@@ -1799,6 +1910,20 @@ process.on('uncaughtException', (err) => {
         }
       };
 
+      // A buy sent from here is noted on disk until its position is saved, so a
+      // stop in between can't leave tokens nobody is tracking (the fast path's
+      // buys are kept by the fast path itself).
+      let myPendingSig = null;
+      const notePendingBuy = (sig) => {
+        if (rehearse || !sig) return;
+        buysInFlight.add(sig);
+        myPendingSig = sig;
+        try {
+          storage.addPendingBuy({ signature: sig, mint, sol: buyAmountSol, at: Date.now(), wallet, venue, dex: portalDex, pool, parent: signature, mode: config.TRADE_TYPE });
+        } catch (err) {
+          warn(`[Main] Couldn't note buy ${sig.slice(0, 8)}… on disk (${err.message}).`);
+        }
+      };
       try {
         let buySig;
         let sentAt = null;
@@ -1880,6 +2005,7 @@ process.on('uncaughtException', (err) => {
               dryRun: rehearse
             });
             sentAt = Date.now();
+            notePendingBuy(buySig);
           } catch (err) {
             if (!(err && err.txSignature)) unclaimCooldown(); // nothing was sent
             if (err && err.coinFiltered) {
@@ -1899,6 +2025,7 @@ process.on('uncaughtException', (err) => {
             if (!(err && err.txSignature)) throw err;
             warn(`[Main] Buy send outcome unknown (${err.message}); checking whether ${err.txSignature} lands...`);
             buySig = err.txSignature;
+            notePendingBuy(buySig);
           }
 
         }
@@ -1939,7 +2066,11 @@ process.on('uncaughtException', (err) => {
           });
         };
         const onLanded = instant ? (landedSlot) => fireLanded(landedSlot, 'its status') : null;
-        if (instant) stopWatch = watchOwnTokens(mint, (raw) => fireLanded(null, 'its tokens arrived', raw));
+        if (instant) {
+          // Read the coin's state now, while the buy is landing, so the sell is built without a lookup.
+          if (venue === 'pumpfun') tradeExecutorMod.prewarmSell(mint);
+          stopWatch = watchOwnTokens(mint, (raw) => fireLanded(null, 'its tokens arrived', raw));
+        }
         const conf = await waitForConfirmation(buySig, config.CONFIRM_TIMEOUT_SEC, { alongWith: signature, onLanded });
         stopWatch();
         if (shred) {
@@ -1974,7 +2105,9 @@ process.on('uncaughtException', (err) => {
           const guardWhy = conf.err ? slotGuard.explainFailure(buySig, conf.err) : null;
           if (guardWhy) {
             info(`[Main] Buy ${buySig} of ${mint} cancelled: ${guardWhy}.`);
+            dropPendingBuy(buySig);
           } else if (conf.err) {
+            dropPendingBuy(buySig);
             noteComputeFailure(buySig, conf.err);
             warn(`[Main] Buy ${buySig} FAILED on-chain: ${explainTxError(conf.err, pool || venue)}; no position opened.`);
           } else {
@@ -2018,6 +2151,7 @@ process.on('uncaughtException', (err) => {
 
         if (receivedRaw !== null && !(receivedRaw > 0n)) {
           const msg = `Buy ${buySig} for ${mint} confirmed but no tokens were received; no position opened.`;
+          dropPendingBuy(buySig);
           warn(`[Main] ${msg}`);
           telegramBot.notifyAlert(msg);
           return;
@@ -2112,6 +2246,7 @@ process.on('uncaughtException', (err) => {
             }
           });
         }
+        dropPendingBuy(buySig); // its position is saved
         release(); // now counted via the position's cost basis instead
         refreshBalance();
         // Copied early from the shreds, and the copy wallet's own buy has
@@ -2178,6 +2313,7 @@ process.on('uncaughtException', (err) => {
         releasePlace();
         // Saved (or definitely not bought): the fast path can forget its report.
         if (fastBought && fastPath) fastPath.saved(fastSent.signature);
+        if (myPendingSig) buysInFlight.delete(myPendingSig);
         const n = (buyingMints.get(mint) || 1) - 1;
         if (n > 0) buyingMints.set(mint, n);
         else buyingMints.delete(mint);
@@ -2664,6 +2800,13 @@ process.on('uncaughtException', (err) => {
         holdCheckRunning = false;
       }
     }
+    // Buys that were sent but never saved as positions (see recoverPendingBuys):
+    // looked at once shortly after starting, then every minute.
+    const PENDING_SWEEP_MS = Number(process.env.PENDING_SWEEP_MS) || 60_000;
+    const pendingFirst = setTimeout(() => recoverPendingBuys('found after a restart').catch((err) => warn(`[Main] Pending-buy check failed: ${err.message}`)), Number(process.env.PENDING_FIRST_MS) || 3000);
+    if (pendingFirst.unref) pendingFirst.unref();
+    const pendingTimer = setInterval(() => recoverPendingBuys('found by the regular check').catch(() => {}), PENDING_SWEEP_MS);
+    if (pendingTimer.unref) pendingTimer.unref();
     const holdCheckTimer = setInterval(() => checkCopyHoldings('regular check').catch(() => {}), HOLD_CHECK_MS);
     if (holdCheckTimer.unref) holdCheckTimer.unref();
     emitter.on('resubscribed', () => {
