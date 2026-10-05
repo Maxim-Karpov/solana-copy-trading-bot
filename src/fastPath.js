@@ -72,6 +72,7 @@ class FastPath extends EventEmitter {
     clearInterval(this.stateTimer);
     clearInterval(this.checkTimer);
     clearTimeout(this.reconnectTimer);
+    clearTimeout(this.soonTimer);
     if (this.sock) {
       const sock = this.sock;
       sock.end();
@@ -128,7 +129,9 @@ class FastPath extends EventEmitter {
       this.hello = null;
       this.verified = false;
       this.feedStates.clear();
-      if (was) {
+      if (was && this.stopped) {
+        // our own shutdown: nothing to report
+      } else if (was) {
         warn('[FastPath] Lost the link with the Rust fast path; reconnecting.');
         this.emit('down');
       } else if (!this.connectWarned && !this.stopped) {
@@ -321,6 +324,13 @@ class FastPath extends EventEmitter {
   _verdict(ok, why, quiet = false, detail = null) {
     const changed = ok !== this.verified;
     this.verified = ok;
+    // Not ready yet (just started: the Pump.fun config is still loading): try
+    // again in 2 s rather than at the next 30 s check, so it can buy sooner.
+    if (!ok && quiet && !this.stopped) {
+      clearTimeout(this.soonTimer);
+      this.soonTimer = setTimeout(() => this.check().catch(() => {}), 2000);
+      if (this.soonTimer.unref) this.soonTimer.unref();
+    }
     this.send({ type: 'verified', ok, why: why || null });
     if (changed && ok) {
       info(

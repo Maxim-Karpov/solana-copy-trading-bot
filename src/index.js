@@ -2256,7 +2256,8 @@ process.on('uncaughtException', (err) => {
     }
 
     async function handleCopyTrade(msg) {
-      if (msg.marks) msg.marks.handler = performance.now();
+      // (A fast-path buy's marks are on the fast path's own clock and already complete.)
+      if (msg.marks && !msg.fastSent) msg.marks.handler = performance.now();
       const { signature, dexs, ca: mint, trade, solAmount, tokenAmount, sellPercent, slot, seenAt, copyPriceSol, copyPriceExact, pairedStock, copyHeldBefore, copyBoughtEarlier, curveHint, shred, fastHint } = msg;
       const wallet = msg.wallet || config.COPY_WALLET;
 
