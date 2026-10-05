@@ -251,6 +251,14 @@ const config = {
   // checked identical at startup, in a fraction of the time. "false" = the
   // SDK route.
   HAND_BUILT_BUYS: (process.env.HAND_BUILT_BUYS || '').trim() !== 'false',
+  // "rust": the Rust fast path (fastpath/) reads the shred feeds and sends
+  // the shred-copied Pump.fun buys it can, this bot does everything else.
+  // Empty (default) = off.
+  FAST_PATH: (process.env.FAST_PATH || '').trim().toLowerCase(),
+  FAST_PATH_PORT: numEnv('FAST_PATH_PORT', { def: 7799, min: 1, max: 65535, integer: true }),
+  // If the fast path is unreachable this long, this bot opens its own shred
+  // feed(s) until it's back.
+  FAST_PATH_FALLBACK_MS: numEnv('FAST_PATH_FALLBACK_MS', { def: 5000, min: 0, integer: true }),
   // Helius feeds (helius-preprocessed shreds and DETECTION_FEED="transaction"):
   // leave out transactions that mention any of these accounts, e.g. a spam
   // program (the [Shreds] summary suggests candidates).
@@ -611,6 +619,16 @@ if (config.TRADE_TYPE === 'TIERED' || config.TRADE_TYPE === 'STIERED') {
   }
   config.SHRED_SOURCES = list;
   config.SHRED_SOURCE = list.join(',');
+}
+
+if (config.FAST_PATH && config.FAST_PATH !== 'rust') fail(`FAST_PATH must be "rust" or empty (got "${process.env.FAST_PATH}")`);
+if (config.FAST_PATH === 'rust') {
+  if (!config.SHRED_SOURCES.some((x) => x === 'shreder' || x === 'helius-preprocessed')) {
+    fail('FAST_PATH="rust" needs SHRED_SOURCE to include "shreder" and/or "helius-preprocessed" (the feeds the fast path reads).');
+  }
+  if (!config.SHRED_FAST_BUY || !config.DIRECT_PUMPFUN_SWAP) {
+    console.warn('[config] WARNING: FAST_PATH="rust" only buys with SHRED_FAST_BUY="true" and DIRECT_PUMPFUN_SWAP="true"; until then it only reads the feeds.');
+  }
 }
 
 config.ENV_FILE = ENV_FILE;

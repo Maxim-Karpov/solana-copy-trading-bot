@@ -8,6 +8,7 @@ const config = require('./config');
 const { info, warn, error } = require('./logger');
 const CopyEmitter = require('./websocket');
 const { ShredFeeds } = require('./shredFeed');
+const { FastPath } = require('./fastPath');
 const prewarm = require('./prewarm');
 const storage = require('./storage');
 const { mapDex, detectVenue, detectPool } = require('./dexMapper');
@@ -19,6 +20,7 @@ const quoteTokens = require('./quoteTokens');
 const buyTiming = require('./buyTiming');
 const slotGuard = require('./slotGuard');
 const leaderInfo = require('./leaderInfo');
+const slotClock = require('./slotClock');
 const computeBudget = require('./computeBudget');
 const hostStats = require('./hostStats');
 const { performance } = require('perf_hooks');
@@ -220,6 +222,24 @@ process.on('uncaughtException', (err) => {
     let lastBuyAt = 0;
     // Paused (via Telegram /pause): no new buys; exits keep working. Persisted.
     let paused = storage.getPaused();
+    // FAST_PATH="rust": the link with the Rust fast path (set up below).
+    let fastPath = null;
+    const buyingMints = new Map(); // mint -> buys of it in flight (from here or the fast path)
+    // The fast path's buys from the moment it decides (its "claim"), until
+    // this bot takes them over: counted against the caps at once.
+    const fastClaims = new Map(); // his signature -> { mint, sol, opensNew, at }
+    function releaseClaim(his) {
+      const c = fastClaims.get(his);
+      if (!c) return;
+      fastClaims.delete(his);
+      if (lastBuyAt === c.at) lastBuyAt = c.prevBuyAt; // nothing went out: no cooldown
+      pendingBuySol = Math.max(0, pendingBuySol - c.sol);
+      if (c.opensNew) pendingNewPositions = Math.max(0, pendingNewPositions - 1);
+      const n = (buyingMints.get(c.mint) || 1) - 1;
+      if (n > 0) buyingMints.set(c.mint, n);
+      else buyingMints.delete(c.mint);
+    }
+    const round2 = (x) => (typeof x === 'number' ? Math.round(x * 100) / 100 : x);
     if (config.START_PAUSED) {
       if (telegramBot.isEnabled()) {
         paused = true;
@@ -1521,15 +1541,41 @@ process.on('uncaughtException', (err) => {
       return { receivedRaw: null, decimals: null, costSol: buyAmountSol };
     }
 
-    async function handleCopyBuy({ signature, mint, solAmount, slot, seenAt, portalDex, venue, pool = null, copyPriceSol = null, copyPriceExact = false, pairedStock = null, copyHeldBefore = null, copyBoughtEarlier = false, curveHint = null, shred = false, fastHint = null, wallet = config.COPY_WALLET, marks = null }) {
-      if (shuttingDown) {
+    async function handleCopyBuy({ signature, mint, solAmount, slot, seenAt, portalDex, venue, pool = null, copyPriceSol = null, copyPriceExact = false, pairedStock = null, copyHeldBefore = null, copyBoughtEarlier = false, curveHint = null, shred = false, fastHint = null, wallet = config.COPY_WALLET, marks = null, fastSent = null }) {
+      // FAST_PATH="rust": the fast path rehearsed this buy (paused): log its timing.
+      if (fastSent && fastSent.status === 'rehearsed') {
+        const r = { buildMs: round2(fastSent.buildMs), readyAt: seenAt + (fastSent.readyMs || 0), label: 'Rust fast path' };
+        info(buyTiming.rehearsal({ mint, hisSlot: slot, seenAt, decideAt: null, result: r, marks, leader: leaderInfo.leaderOf(slot) }) + ' (Rust fast path)');
+        return;
+      }
+      // FAST_PATH="rust": already bought by the fast path; everything from here on is ours.
+      const fastBought = Boolean(fastSent && fastSent.status === 'bought');
+      if (fastBought && fastSent.resent && storage.getAllPositions().some((p) => p.buy_signature === fastSent.signature)) {
+        // Resent after a reconnect, but already taken over before it.
+        if (fastPath) {
+          fastPath.ack(fastSent.signature);
+          fastPath.saved(fastSent.signature);
+        }
+        return;
+      }
+      if (shuttingDown && !fastBought) {
         info(`[Main] Shutting down; not opening a new buy for ${mint}.`);
         return;
       }
 
       // PAUSED_REHEARSAL: a paused bot still goes through a shred buy up to
       // the send (checks, build, signing) to measure its timing.
-      const rehearse = paused && shred && (config.PAUSED_REHEARSAL || config.REHEARSE_ONLY);
+      const rehearse = !fastBought && paused && shred && (config.PAUSED_REHEARSAL || config.REHEARSE_ONLY);
+      const existing = activeByMint(mint)[0] || null;
+      const copyAmountSol = Math.abs(solAmount);
+      let buyAmountSol = fastBought ? fastSent.amountSol : null;
+      // The copy wallet's own sells that landed after this buy but were
+      // processed first (used again once the buy has filled).
+      const remainingFrac = MIRRORS_COPY_SELLS.has(config.TRADE_TYPE)
+        ? remainingAfterLaterSells(mint, slot, config.TRADE_TYPE, wallet)
+        : 1;
+      checks: {
+      if (fastBought) break checks;
       if (paused && !rehearse) {
         info(`[Main] Buying is paused; not copying the buy of ${mint}.`);
         return;
@@ -1540,7 +1586,11 @@ process.on('uncaughtException', (err) => {
         return;
       }
 
-      const existing = activeByMint(mint)[0] || null;
+      if (!existing && buyingMints.has(mint)) {
+        // The fast path (or another buy here) is buying this coin right now.
+        info(`[Main] Copy wallet${who(wallet)} bought ${mint}, which is already being bought; not buying it again.`);
+        return;
+      }
       if (existing && walletOf(existing) !== wallet) {
         // Bought on another copy wallet's buy: that wallet's trades run it.
         info(`[Main] Copy wallet${who(wallet)} bought ${mint}, which you already hold from${who(walletOf(existing))}'s buy; not adding to it.`);
@@ -1579,9 +1629,6 @@ process.on('uncaughtException', (err) => {
 
       // The copy wallet's own sells that landed after this buy but were
       // processed first: if they've already sold out, don't buy at all.
-      const remainingFrac = MIRRORS_COPY_SELLS.has(config.TRADE_TYPE)
-        ? remainingAfterLaterSells(mint, slot, config.TRADE_TYPE, wallet)
-        : 1;
       if (remainingFrac <= 0.001) {
         info(`[Main] Copy wallet already sold out of ${mint} after this buy; skipping it.`);
         return;
@@ -1606,13 +1653,12 @@ process.on('uncaughtException', (err) => {
         }
       }
 
-      const copyAmountSol = Math.abs(solAmount);
       // MIN_COPY_BUY_SOL: ignore the copy wallet's small (test / low-conviction) buys.
       if (config.MIN_COPY_BUY_SOL !== null && copyAmountSol < config.MIN_COPY_BUY_SOL) {
         info(`[Main] Copy wallet's buy of ${mint} is ${copyAmountSol} SOL, below MIN_COPY_BUY_SOL (${config.MIN_COPY_BUY_SOL}); not buying.`);
         return;
       }
-      let buyAmountSol = sizeBuy(copyAmountSol);
+      buyAmountSol = sizeBuy(copyAmountSol);
 
       // --- Risk cap #1: hard per-trade ceiling (clamp, never skip) ---
       if (buyAmountSol > config.MAX_BUY_AMOUNT) {
@@ -1670,8 +1716,7 @@ process.on('uncaughtException', (err) => {
       // allowed is skipped (adding to one you hold is not a new position).
       // Checked and reserved with no await in between, so buys arriving
       // together can't both take the last place.
-      const opensNew = !existing;
-      if (opensNew && config.MAX_OPEN_POSITIONS > 0 && openPositionCount() >= config.MAX_OPEN_POSITIONS) {
+      if (!existing && config.MAX_OPEN_POSITIONS > 0 && openPositionCount() >= config.MAX_OPEN_POSITIONS) {
         const open = openPositionCount();
         info(
           `[Main] Skipping buy of ${mint}${who(wallet)}: ${open} position(s) open or being bought, ` +
@@ -1680,6 +1725,8 @@ process.on('uncaughtException', (err) => {
         if (!rehearse) notifySkip('cap', `⛔ Skipped ${mint.slice(0, 4)}...${mint.slice(-4)}: already ${open} open position(s) (MAX_OPEN_POSITIONS=${config.MAX_OPEN_POSITIONS}).`);
         return;
       }
+      } // checks
+      const opensNew = !existing;
 
       // Reserve the SOL (and the position's place) before the first await
       // so concurrent buys see it.
@@ -1690,10 +1737,20 @@ process.on('uncaughtException', (err) => {
       const unclaimCooldown = () => {
         if (lastBuyAt === myBuyAt) lastBuyAt = prevBuyAt;
       };
-      pendingBuySol += buyAmountSol;
-      if (opensNew) pendingNewPositions += 1;
+      // A fast path buy was already counted when it claimed his transaction.
+      const claim = fastBought ? fastClaims.get(signature) : null;
+      if (claim) fastClaims.delete(signature);
+      if (!claim) {
+        pendingBuySol += buyAmountSol;
+        if (opensNew) pendingNewPositions += 1;
+        // Being bought: the fast path leaves this coin alone meanwhile.
+        buyingMints.set(mint, (buyingMints.get(mint) || 0) + 1);
+        if (fastPath) fastPath.pushState();
+      } else if (claim.sol !== buyAmountSol) {
+        pendingBuySol = Math.max(0, pendingBuySol - claim.sol + buyAmountSol);
+      }
       let reserved = true;
-      let placeReserved = opensNew;
+      let placeReserved = claim ? claim.opensNew : opensNew;
       const releasePlace = () => {
         if (placeReserved) {
           pendingNewPositions = Math.max(0, pendingNewPositions - 1);
@@ -1708,89 +1765,107 @@ process.on('uncaughtException', (err) => {
       };
 
       try {
-        info(
-          `[Main] Copy buy detected${who(wallet)}: mint=${mint}, SOL=${copyAmountSol} (mode=${config.TRADE_TYPE}). ` +
-            `${rehearse ? 'Buying is paused: rehearsing' : 'Placing'} our BUY of ${buyAmountSol} SOL (venue=${venue}, dex=${portalDex})...`
-        );
+        let buySig;
+        let sentAt = null;
+        let decideAt = null;
+        if (fastBought) {
+          // Sent by the Rust fast path: record it as if sent from here.
+          buySig = fastSent.signature;
+          sentAt = fastSent.sentAt || null;
+          tradeExecutorMod.noteExternalBuy(buySig, { buildMs: fastSent.buildMs, sendMs: fastSent.sendMs, sentAt, guard: fastSent.guard, compute: fastSent.compute });
+          if (fastPath) {
+            fastPath.ack(buySig);
+            fastPath.pushState();
+          }
+          info(
+            `[Main] Copy buy detected${who(wallet)}: mint=${mint}, SOL=${copyAmountSol} (mode=${config.TRADE_TYPE}). ` +
+              `The Rust fast path bought ${buyAmountSol} SOL (${fastSent.via || 'Pump.fun'}, built and signed in ${round2(fastSent.buildMs)} ms, Sender answered in ${Math.round(fastSent.sendMs || 0)} ms): https://solscan.io/tx/${buySig}`
+          );
+          if (fastSent.ambiguous) warn(`[Main] The fast path couldn't tell whether ${buySig} was accepted (${fastSent.ambiguous}); following it by signature.`);
+        } else {
+          info(
+            `[Main] Copy buy detected${who(wallet)}: mint=${mint}, SOL=${copyAmountSol} (mode=${config.TRADE_TYPE}). ` +
+              `${rehearse ? 'Buying is paused: rehearsing' : 'Placing'} our BUY of ${buyAmountSol} SOL (venue=${venue}, dex=${portalDex})...`
+          );
 
-        // MAX_ENTRY_PREMIUM_PCT: the most we'll pay per token vs the copy wallet.
-        let priceCheck = null;
-        if (config.MAX_ENTRY_PREMIUM_PCT !== null) {
-          if (copyPriceSol > 0) priceCheck = { copyPriceSol, maxPct: config.MAX_ENTRY_PREMIUM_PCT };
-          else info(`[Main] MAX_ENTRY_PREMIUM_PCT: the copy wallet's price for ${mint} isn't known; buying without the price check.`);
-        }
+          // MAX_ENTRY_PREMIUM_PCT: the most we'll pay per token vs the copy wallet.
+          let priceCheck = null;
+          if (config.MAX_ENTRY_PREMIUM_PCT !== null) {
+            if (copyPriceSol > 0) priceCheck = { copyPriceSol, maxPct: config.MAX_ENTRY_PREMIUM_PCT };
+            else info(`[Main] MAX_ENTRY_PREMIUM_PCT: the copy wallet's price for ${mint} isn't known; buying without the price check.`);
+          }
 
-        // MAX_SLOTS_BEHIND: the buy cancels itself on-chain if it lands too late.
-        let guard = null;
-        if (config.MAX_SLOTS_BEHIND !== null && slotGuard.isAvailable()) {
-          if (typeof slot !== 'number') {
-            info(`[Main] Skipping buy of ${mint}: the copy wallet's slot isn't known, so MAX_SLOTS_BEHIND can't be enforced. Nothing was sent.`);
+          // MAX_SLOTS_BEHIND: the buy cancels itself on-chain if it lands too late.
+          let guard = null;
+          if (config.MAX_SLOTS_BEHIND !== null && slotGuard.isAvailable()) {
+            if (typeof slot !== 'number') {
+              info(`[Main] Skipping buy of ${mint}: the copy wallet's slot isn't known, so MAX_SLOTS_BEHIND can't be enforced. Nothing was sent.`);
+              unclaimCooldown();
+              return;
+            }
+            guard = { maxSlot: slot + config.MAX_SLOTS_BEHIND, seenAt, slotsAllowed: config.MAX_SLOTS_BEHIND };
+          }
+
+          // LEADER_MAX_KM: the slot(s) it could land in are led from too far
+          // away to reach in time; it would be cancelled (or land late) and
+          // still pay its priority fee.
+          const reach = leaderInfo.reachable(slot, guard ? guard.slotsAllowed : 0);
+          if (!reach.ok) {
+            info(`[Main] ${rehearse ? 'Rehearsal: would skip' : 'Skipping'} buy of ${mint}: ${reach.why}, so it would almost certainly arrive too late. Nothing was sent.`);
+            buyTiming.noteSkipped();
+            if (!rehearse) notifySkip('leader', `⛔ Skipped ${mint.slice(0, 4)}...${mint.slice(-4)}: ${reach.why}.`);
             unclaimCooldown();
             return;
           }
-          guard = { maxSlot: slot + config.MAX_SLOTS_BEHIND, seenAt, slotsAllowed: config.MAX_SLOTS_BEHIND };
-        }
 
-        // LEADER_MAX_KM: the slot(s) it could land in are led from too far
-        // away to reach in time; it would be cancelled (or land late) and
-        // still pay its priority fee.
-        const reach = leaderInfo.reachable(slot, guard ? guard.slotsAllowed : 0);
-        if (!reach.ok) {
-          info(`[Main] ${rehearse ? 'Rehearsal: would skip' : 'Skipping'} buy of ${mint}: ${reach.why}, so it would almost certainly arrive too late. Nothing was sent.`);
-          buyTiming.noteSkipped();
-          if (!rehearse) notifySkip('leader', `⛔ Skipped ${mint.slice(0, 4)}...${mint.slice(-4)}: ${reach.why}.`);
-          unclaimCooldown();
-          return;
-        }
-
-        // Copied early from the shreds, and his buy has already failed: it
-        // never held the coin, so there is nothing to copy.
-        if (failedCopyBuys.has(signature)) {
-          info(`[Main] Not buying ${mint}: the copy wallet's buy ${signature} has already failed. Nothing was sent.`);
-          unclaimCooldown();
-          return;
-        }
-
-        let buySig;
-        let sentAt = null;
-        const decideAt = Date.now();
-        if (marks) marks.decide = performance.now();
-        try {
-          buySig = await buyToken({
-            mint,
-            amountSol: buyAmountSol,
-            slippage: config.SLIPPAGE,
-            tip: config.JITO_TIP,
-            dex: portalDex,
-            venue,
-            pool,
-            priceCheck,
-            curveHint,
-            coinFilter: COIN_FILTER,
-            slotGuard: guard,
-            fastHint,
-            dryRun: rehearse
-          });
-          sentAt = Date.now();
-        } catch (err) {
-          if (!(err && err.txSignature)) unclaimCooldown(); // nothing was sent
-          if (err && err.coinFiltered) {
-            info(`[Main] ${rehearse ? 'Rehearsal: would skip' : 'Skipping'} buy of ${mint}: ${err.message} (${err.setting}). Nothing was sent.`);
-            if (!rehearse) telegramBot.notifyInfo(`⛔ Skipped ${mint.slice(0, 4)}...${mint.slice(-4)}: ${err.short}.`);
+          // Copied early from the shreds, and his buy has already failed: it
+          // never held the coin, so there is nothing to copy.
+          if (failedCopyBuys.has(signature)) {
+            info(`[Main] Not buying ${mint}: the copy wallet's buy ${signature} has already failed. Nothing was sent.`);
+            unclaimCooldown();
             return;
           }
-          if (err && err.entryPriceTooHigh) {
-            info(`[Main] ${rehearse ? 'Rehearsal: would skip' : 'Skipping'} buy of ${mint}: ${err.message} (MAX_ENTRY_PREMIUM_PCT). Nothing was sent.`);
-            if (!rehearse) telegramBot.notifyInfo(
-              `⛔ Skipped ${mint.slice(0, 4)}...${mint.slice(-4)}: price already ${err.premiumPct >= 0 ? '+' : ''}${err.premiumPct.toFixed(0)}% above the copy wallet's (your max is ${err.maxPct}%).`
-            );
-            return;
+
+          decideAt = Date.now();
+          if (marks) marks.decide = performance.now();
+          try {
+            buySig = await buyToken({
+              mint,
+              amountSol: buyAmountSol,
+              slippage: config.SLIPPAGE,
+              tip: config.JITO_TIP,
+              dex: portalDex,
+              venue,
+              pool,
+              priceCheck,
+              curveHint,
+              coinFilter: COIN_FILTER,
+              slotGuard: guard,
+              fastHint,
+              dryRun: rehearse
+            });
+            sentAt = Date.now();
+          } catch (err) {
+            if (!(err && err.txSignature)) unclaimCooldown(); // nothing was sent
+            if (err && err.coinFiltered) {
+              info(`[Main] ${rehearse ? 'Rehearsal: would skip' : 'Skipping'} buy of ${mint}: ${err.message} (${err.setting}). Nothing was sent.`);
+              if (!rehearse) telegramBot.notifyInfo(`⛔ Skipped ${mint.slice(0, 4)}...${mint.slice(-4)}: ${err.short}.`);
+              return;
+            }
+            if (err && err.entryPriceTooHigh) {
+              info(`[Main] ${rehearse ? 'Rehearsal: would skip' : 'Skipping'} buy of ${mint}: ${err.message} (MAX_ENTRY_PREMIUM_PCT). Nothing was sent.`);
+              if (!rehearse) telegramBot.notifyInfo(
+                `⛔ Skipped ${mint.slice(0, 4)}...${mint.slice(-4)}: price already ${err.premiumPct >= 0 ? '+' : ''}${err.premiumPct.toFixed(0)}% above the copy wallet's (your max is ${err.maxPct}%).`
+              );
+              return;
+            }
+            // Connection dropped after the request went out: the buy may still
+            // land, so follow it by signature instead of assuming it failed.
+            if (!(err && err.txSignature)) throw err;
+            warn(`[Main] Buy send outcome unknown (${err.message}); checking whether ${err.txSignature} lands...`);
+            buySig = err.txSignature;
           }
-          // Connection dropped after the request went out: the buy may still
-          // land, so follow it by signature instead of assuming it failed.
-          if (!(err && err.txSignature)) throw err;
-          warn(`[Main] Buy send outcome unknown (${err.message}); checking whether ${err.txSignature} lands...`);
-          buySig = err.txSignature;
+
         }
 
         if (rehearse) {
@@ -2065,6 +2140,11 @@ process.on('uncaughtException', (err) => {
       } finally {
         release();
         releasePlace();
+        // Saved (or definitely not bought): the fast path can forget its report.
+        if (fastBought && fastPath) fastPath.saved(fastSent.signature);
+        const n = (buyingMints.get(mint) || 1) - 1;
+        if (n > 0) buyingMints.set(mint, n);
+        else buyingMints.delete(mint);
       }
     }
 
@@ -2186,7 +2266,7 @@ process.on('uncaughtException', (err) => {
         return;
       }
       if (trade === 'buy' && solAmount < 0) {
-        await handleCopyBuy({ signature, mint, solAmount, slot, seenAt, portalDex, venue, pool, copyPriceSol, copyPriceExact, pairedStock, copyHeldBefore, copyBoughtEarlier, curveHint, shred: !!shred, fastHint: fastHint || null, wallet, marks: msg.marks || null });
+        await handleCopyBuy({ signature, mint, solAmount, slot, seenAt, portalDex, venue, pool, copyPriceSol, copyPriceExact, pairedStock, copyHeldBefore, copyBoughtEarlier, curveHint, shred: !!shred, fastHint: fastHint || null, wallet, marks: msg.marks || null, fastSent: msg.fastSent || null });
       } else if (trade === 'sell' && tokenAmount < 0) {
         await handleCopySell({ mint, sellPercent, slot, wallet });
       }
@@ -2287,11 +2367,140 @@ process.on('uncaughtException', (err) => {
       });
     }
 
+    // What the fast path needs to decide a buy the way handleCopyBuy would.
+    // Anything it can't be sure of, it leaves to this bot.
+    const creatorVaultText = new Map();
+    let farCache = { at: 0, ranges: [] };
+    function farSlotRanges() {
+      if (config.LEADER_MAX_KM === null) return [];
+      if (Date.now() - farCache.at < 2000) return farCache.ranges;
+      const now = slotClock.latestSlot ? slotClock.latestSlot() : null;
+      const ranges = [];
+      if (typeof now === 'number') {
+        let start = null;
+        for (let x = now; x <= now + 1500; x++) {
+          const l = leaderInfo.leaderOf(x);
+          const far = Boolean(l && l.km !== null && l.km > config.LEADER_MAX_KM);
+          if (far && start === null) start = x;
+          if (!far && start !== null) {
+            ranges.push([start, x - 1]);
+            start = null;
+          }
+        }
+        if (start !== null) ranges.push([start, now + 1500]);
+      }
+      farCache = { at: Date.now(), ranges };
+      return ranges;
+    }
+    function fastPathState() {
+      const { creatorVaultPda } = require('@pump-fun/pump-sdk');
+      const wallets = {};
+      for (const w of config.COPY_WALLETS) {
+        const h = holdingsOf(w);
+        const exited = [];
+        if (config.SKIP_REBUYS !== 'off') {
+          for (const k of exitedMints) {
+            const i = k.indexOf(':');
+            if (i === -1) exited.push(k);
+            else if (k.slice(0, i) === w) exited.push(k.slice(i + 1));
+          }
+        }
+        wallets[w] = { allowed: true, holdingsLoaded: h.loaded, held: h.loaded ? [...h.atStart, ...h.seen] : [], exited };
+      }
+      const positions = [...buyingMints.keys()];
+      for (const p of activeMap.values()) if (p.status === 'active') positions.push(p.mint);
+      const blockedVaults = [];
+      if (COIN_FILTER && COIN_FILTER.blockedCreators) {
+        for (const c of COIN_FILTER.blockedCreators) {
+          if (!creatorVaultText.has(c)) {
+            try {
+              creatorVaultText.set(c, creatorVaultPda(new PublicKey(c)).toBase58());
+            } catch {
+              creatorVaultText.set(c, null);
+            }
+          }
+          if (creatorVaultText.get(c)) blockedVaults.push(creatorVaultText.get(c));
+        }
+      }
+      const tipSol = config.SEND_VIA === 'sender' ? config.SENDER_TIP : config.JITO_TIP;
+      const stocks = require('./stockTokens').stockRules();
+      const tt = config.TRADE_TYPE;
+      const sizing = tt === 'EXACT'
+        ? { mode: 'exact' }
+        : tt === 'TIERED' || tt === 'STIERED'
+          ? { mode: 'tiers', tiers: config.TIER_BUY_CONFIG.map((t) => [t.maxSol, t.buyAmount]) }
+          : { mode: 'fixed', fixed: config.BUY_AMOUNT };
+      return {
+        buying: !paused && !shuttingDown,
+        rehearse: !shuttingDown && paused && (config.PAUSED_REHEARSAL || config.REHEARSE_ONLY),
+        fastBuy: Boolean(config.SHRED_FAST_BUY && config.DIRECT_PUMPFUN_SWAP && config.HAND_BUILT_BUYS && fastPath && fastPath.verified),
+        onlyFirstBuy: Boolean(config.ONLY_COPY_FIRST_BUY),
+        wallets,
+        positions,
+        sizing,
+        minTradeSol: config.MIN_TRADE_SOL,
+        minCopyBuySol: config.MIN_COPY_BUY_SOL,
+        maxBuySol: config.MAX_BUY_AMOUNT,
+        roomSol: config.MAX_TOTAL_EXPOSURE - currentExposureSol(),
+        spendableSol: walletSol === null ? null : walletSol - tipSol - FEE_RESERVE_SOL,
+        cooldownMs: config.BUY_COOLDOWN_SEC * 1000,
+        lastBuyAt,
+        openSlots: config.MAX_OPEN_POSITIONS > 0 ? config.MAX_OPEN_POSITIONS - openPositionCount() : null,
+        maxMcapSol: COIN_FILTER ? COIN_FILTER.maxMcapSol : null,
+        minMcapSet: Boolean(COIN_FILTER && COIN_FILTER.minMcapSol !== null),
+        blockedVaults,
+        quoteMints: [...quoteTokens.knownQuoteMintList(), ...stocks.mints],
+        quotePrefixes: stocks.prefixes,
+        maxSlotsBehind: config.MAX_SLOTS_BEHIND,
+        guardAvailable: slotGuard.isAvailable(),
+        farSlots: farSlotRanges(),
+        fees: {
+          buyFeeSol: config.BUY_PRIORITY_FEE_SOL,
+          buyFeePct: config.BUY_PRIORITY_FEE_PCT || 0,
+          useSender: config.SEND_VIA === 'sender',
+          senderTip: config.SENDER_TIP,
+          jitoTip: config.JITO_TIP,
+          ceiling: config.PUMPFUN_COMPUTE_UNITS
+        },
+        computeLimits: computeBudget.allEstimates(config.PUMPFUN_COMPUTE_UNITS)
+      };
+    }
+
+    // FAST_PATH="rust": the Rust fast path reads the shred feeds and sends the
+    // shred-copied Pump.fun buys it can; it needs this bot's state to decide.
+    if (config.FAST_PATH === 'rust') {
+      fastPath = new FastPath({ stateProvider: fastPathState });
+      fastPath.on('claim', (m) => {
+        if (!m.his || fastClaims.has(m.his) || !(m.amountSol > 0)) return;
+        const opensNew = activeByMint(m.mint).length === 0;
+        fastClaims.set(m.his, { mint: m.mint, sol: m.amountSol, opensNew, at: Date.now(), prevBuyAt: lastBuyAt });
+        pendingBuySol += m.amountSol;
+        if (opensNew) pendingNewPositions += 1;
+        buyingMints.set(m.mint, (buyingMints.get(m.mint) || 0) + 1);
+        lastBuyAt = fastClaims.get(m.his).at;
+        fastPath.pushState();
+      });
+      fastPath.on('unclaim', (m) => {
+        releaseClaim(m.his);
+        fastPath.pushState();
+      });
+      // A claim whose report never came (the fast path stopped and lost it):
+      // released after 10 minutes. A report waiting in this coin's queue is
+      // still counted meanwhile.
+      const claimSweep = setInterval(() => {
+        for (const [his, c] of fastClaims) if (Date.now() - c.at > 600_000) releaseClaim(his);
+      }, 30_000);
+      if (claimSweep.unref) claimSweep.unref();
+      fastPath.start();
+      info(`[Main] FAST_PATH="rust": linking with the Rust fast path on 127.0.0.1:${config.FAST_PATH_PORT}.`);
+    }
+
     // SHRED_SOURCE: decoded shreds alongside the websocket feed (see
     // shredFeed.js); several sources run side by side, first report wins.
     let shredFeed = null;
     if (config.SHRED_SOURCE) {
       shredFeed = new ShredFeeds({
+        fastPath,
         emitter,
         isHeld: (mint, wallet = config.COPY_WALLET) => {
           const h = holdingsOf(wallet);
@@ -2582,6 +2791,7 @@ process.on('uncaughtException', (err) => {
       clearInterval(sweepTimer);
       emitter.disconnect();
       if (shredFeed) shredFeed.stop();
+      if (fastPath) fastPath.stop();
       prewarm.stop();
       await telegramBot.stop();
 

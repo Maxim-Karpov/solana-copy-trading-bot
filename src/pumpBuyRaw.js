@@ -445,6 +445,11 @@ function disable(reason) {
   disabled = reason;
 }
 
+/** The current template (for the Rust fast path), or null. */
+function getTemplate() {
+  return template && !disabled ? template : null;
+}
+
 function status() {
   return { ready: template !== null && !disabled, disabled, user: template ? new PublicKey(template.user).toBase58() : null };
 }
@@ -454,4 +459,4 @@ function _resetForTests() {
   disabled = null;
 }
 
-module.exports = { buildBuy, setTemplate, ready, disable, status, compileV0, HandBuiltTx, keySetOf, coinAccounts, derive, isOnCurve, ROLE, _resetForTests };
+module.exports = { getTemplate, buildBuy, setTemplate, ready, disable, status, compileV0, HandBuiltTx, keySetOf, coinAccounts, derive, isOnCurve, ROLE, _resetForTests };

@@ -692,6 +692,84 @@ async function compareHandBuilt(buildPumpfunBuyTx, pumpBuyRaw) {
   return { ok: true, sdkMs: t1 - t0, handMs: t2 - t1 };
 }
 
+/**
+ * FAST_PATH="rust": the same practice buy built here (hand-built) and by the
+ * Rust fast path, with the same inputs; the signed bytes must be identical.
+ * Returns { ok, why, rustUs } or null if not ready.
+ */
+async function compareWithRust(fastPath) {
+  const pumpBuyRaw = require('./pumpBuyRaw');
+  const prewarm = require('./prewarm');
+  const { minTokensAtMcap, recipientsOf } = require('./pumpfunDirect');
+  const { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID: SPL, TOKEN_2022_PROGRAM_ID: T22 } = require('@solana/spl-token');
+  const sdk = require('@pump-fun/pump-sdk');
+  const global = prewarm.pumpGlobal();
+  const blockhash = prewarm.blockhash();
+  if (!global || !blockhash || !pumpBuyRaw.ready(walletPublicKey)) return null;
+  const results = [];
+  for (const [prog, guarded] of [[T22, true], [SPL, false]]) {
+    const mint = Keypair.generate().publicKey;
+    const curve = sdk.bondingCurvePda(mint);
+    const feeRecipient = recipientsOf(global).normal[0];
+    const txKeys = [curve, getAssociatedTokenAddressSync(mint, curve, true, prog), sdk.bondingCurveV2Pda(mint), new PublicKey(feeRecipient)].map((k) => k.toBase58());
+    const creatorVault = sdk.creatorVaultPda(Keypair.generate().publicKey).toBase58();
+    const lamports = 123456789n;
+    const maxMcapSol = config.MAX_MARKET_CAP_SOL || 300;
+    const feeSol = priorityFeeSol('buy', 0.123456789);
+    const ceiling = PUMPFUN_CU_LIMIT;
+    const plan = handBuiltPlan(feeSol, ceiling, effectiveTip(config.JITO_TIP));
+    const guardMaxSlot = guarded ? 987654321 : null;
+    const kind = `buy|${guarded ? 'L2TExM+' : ''}AToken+6EF8rr|${prog.equals(T22) ? 't22' : 'spl'}|a18`;
+    const mine = pumpBuyRaw.buildBuy({
+      user: walletPublicKey,
+      mint: mint.toBase58(),
+      txKeys,
+      creatorVault,
+      feeRecipients: [new PublicKey(feeRecipient).toBuffer()],
+      lamports,
+      minOut: minTokensAtMcap(global, lamports, maxMcapSol),
+      fees: { feeSol, ceiling, useSender: USE_SENDER },
+      guardInstructions: guarded ? [slotGuardMod.maxSlotInstruction(guardMaxSlot)] : [],
+      tip: plan.tip,
+      blockhash
+    });
+    if (!mine.tx) return { ok: false, why: `this bot couldn't build the practice buy (${mine.reason})` };
+    mine.tx.sign(walletKeypair);
+    const wire = Buffer.from(mine.tx.serialize());
+    const r = await fastPath.practice({
+      mint: mint.toBase58(),
+      txKeys,
+      knownTokenProgram: null,
+      creatorVault,
+      feeRecipient,
+      lamports: lamports.toString(),
+      maxMcapSol,
+      fees: { feeSol, ceiling, useSender: USE_SENDER, learnedLimit: computeBudget.estimate(kind, ceiling) },
+      guardMaxSlot,
+      tip: plan.tip ? { account: String(plan.tip.account), lamports: plan.tip.lamports } : null,
+      blockhash
+    });
+    if (!r || !r.ok) return { ok: false, why: `the Rust fast path couldn't build the practice buy (${(r && r.error) || 'no answer'})` };
+    const theirs = Buffer.from(r.wire, 'base64');
+    if (!theirs.equals(wire)) {
+      let at = 0;
+      while (at < wire.length && wire[at] === theirs[at]) at++;
+      return { ok: false, why: `its practice buy differs from this bot's (first difference at byte ${at} of ${wire.length})` };
+    }
+    if (r.kind !== mine.tx.compute.kind || r.limit !== mine.tx.compute.limit) return { ok: false, why: `its compute sizing differs (${r.kind} ${r.limit} vs ${mine.tx.compute.kind} ${mine.tx.compute.limit})` };
+    results.push(r.buildUs);
+  }
+  return { ok: true, why: null, rustUs: Math.max(...results) };
+}
+
+/** A buy the Rust fast path sent: remembered as if sent from here (timing, slot guard, compute learning). */
+function noteExternalBuy(signature, { buildMs = null, sendMs = null, sentAt = null, guard = null, compute = null } = {}) {
+  if (!signature) return;
+  rememberTiming(signature, { buildMs: buildMs === null ? null : Math.round(buildMs * 100) / 100, sendMs: sendMs === null ? null : Math.round(sendMs), sentAt });
+  if (guard && typeof guard.ixIndex === 'number') slotGuardMod.remember(signature, guard);
+  if (compute && compute.kind) computeBudget.remember(signature, compute.kind, compute.limit, compute.learned);
+}
+
 /** Instructions as text (program, accounts with signer/writable flags, data), random picks normalised. */
 function describeForCompare(tx, recipients, tips) {
   const msg = tx.message;
@@ -853,4 +931,4 @@ module.exports = {
   checkCoinFilters,
   checkEntryPrice,
   _resetForTests: () => { portalDown.until = 0; directUnsupported.clear(); },
-  describePortalError, buyToken, sellToken, signAndSendTx, prepareAndSign, practiceHandBuilt, compareHandBuilt, handBuiltPlan, AmbiguousSendError };
+  describePortalError, buyToken, sellToken, signAndSendTx, prepareAndSign, practiceHandBuilt, compareHandBuilt, compareWithRust, noteExternalBuy, handBuiltPlan, AmbiguousSendError };

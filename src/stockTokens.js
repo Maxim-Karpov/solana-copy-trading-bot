@@ -72,4 +72,9 @@ function findStockInTx(parsedTx, coinMint) {
   return null;
 }
 
-module.exports = { isStockToken, stockLabel, findStockInTx, KNOWN_STOCKS: KNOWN };
+/** Every listed stock mint, and the prefixes treated as stock tokens (for the Rust fast path). */
+function stockRules() {
+  return { mints: [...Object.keys(KNOWN), ...extra], prefixes: ['Xs', 'Pre'] };
+}
+
+module.exports = { isStockToken, stockLabel, findStockInTx, stockRules, KNOWN_STOCKS: KNOWN };

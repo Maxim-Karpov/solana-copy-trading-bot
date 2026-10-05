@@ -123,9 +123,11 @@ class ShredFeed extends EventEmitter {
     learner = null, // shared between sources running side by side
     earlyExits = null, // ditto, so a sell is acted on once
     race = null, // FeedRace, when several sources run
-    tag = '[Shreds]'
+    tag = '[Shreds]',
+    fastPath = null // FAST_PATH="rust": the link with the Rust fast path (source 'rust')
   } = {}) {
     super();
+    this.fastPath = fastPath;
     this.sourceOpt = source;
     this.race = race;
     this.tag = tag;
@@ -181,6 +183,10 @@ class ShredFeed extends EventEmitter {
     }
     if (this.source === 'shreder') {
       this._startShreder();
+      return;
+    }
+    if (this.source === 'rust') {
+      this._startRust();
       return;
     }
     const { target, secure } = parseTarget(config.SHRED_STREAM_URL);
@@ -452,6 +458,96 @@ class ShredFeed extends EventEmitter {
     });
   }
 
+  // ---- the Rust fast path (FAST_PATH="rust") ----
+
+  _startRust() {
+    const fp = this.fastPath;
+    if (!fp) throw new Error('FAST_PATH="rust" but no fast path link');
+    fp.learner = this.learner; // its learned routers go to the fast path
+    fp.tables = this.tables; // and the lookup tables loaded here
+    const update = (detail = '') => {
+      const states = [...fp.feedStates.values()];
+      if (fp.isUp()) this._setState('up');
+      else if (fp.connected && states.length && states.every((x) => x === 'stopped')) this._setState('stopped', detail || 'every feed of the fast path stopped');
+      else this._setState('down');
+    };
+    fp.on('feed', (m) => {
+      if (m.state === 'stopped') warn(`${this.tag} The fast path's ${sourceLabel(m.source)} feed stopped${m.detail ? `: ${m.detail}` : ''}.`);
+      update(m.detail);
+    });
+    fp.on('down', () => update());
+    fp.on('linked', () => update());
+    fp.on('tx', (m) => {
+      try {
+        this._onRustTx(m);
+      } catch (err) {
+        this._parseError(err);
+      }
+    });
+    fp.on('seen', (m) => {
+      if (this.race) this.race.note(m.source, m.signature, m.at, m.slot);
+    });
+    // It's buying this transaction: no other feed here may act on it.
+    this.claimed = new Set();
+    fp.on('claim', (m) => {
+      if (!m.his || !this.emitter) return;
+      if (!this.emitter._markSeen(m.his)) this.claimed.add(m.his);
+    });
+    fp.on('unclaim', (m) => {
+      if (m.his && this.claimed.delete(m.his) && this.emitter && this.emitter.seenSignatures) this.emitter.seenSignatures.delete(m.his);
+    });
+    fp.on('unreadable', () => {
+      this.stats.messages += 1;
+      this.stats.parseErrors += 1;
+    });
+    this._setState('down');
+    // Lookup tables found here reach the fast path too.
+    this.tablesTimer = setInterval(() => fp.pushTables(), 30_000);
+    if (this.tablesTimer.unref) this.tablesTimer.unref();
+  }
+
+  /**
+   * One copy-wallet transaction from the fast path, with what it did:
+   * bought / rehearsed (we take it from there), or declined / none (handled
+   * here as any shred transaction). Exposed for tests.
+   */
+  _onRustTx(m) {
+    this.stats.messages += 1;
+    if (this.stopped) return;
+    const tx = fromRustTx(m.tx);
+    this.stats.bytes += tx.size;
+    const slot = Number(m.slot);
+    if (this.race) this.race.note(m.source, tx.signature, m.at, slot);
+    const outcome = m.outcome || { status: 'none' };
+    const fast = outcome.status === 'bought' || outcome.status === 'rehearsed' ? outcome : null;
+    if (fast && fast.signature) {
+      // A report can come twice (resent after a reconnect): take it over once.
+      this.fastReports = this.fastReports || new Set();
+      if (this.fastReports.has(fast.signature)) return;
+      this.fastReports.add(fast.signature);
+      if (this.fastReports.size > 2000) this.fastReports.delete(this.fastReports.values().next().value);
+      if (m.resent) fast.resent = true;
+      if (m.resent) setImmediate(() => info(`${this.tag} The fast path's buy ${fast.signature} of ${fast.mint} reached this bot only now (resent after a reconnect); taking it over.`));
+    }
+    if (this.claimed) this.claimed.delete(tx.signature);
+    if (!fast && this.emitter && this.emitter.seenSignatures && this.emitter.seenSignatures.has(tx.signature)) return;
+    if (outcome.status === 'declined' && outcome.reason && outcome.mint) {
+      setImmediate(() => info(`${this.tag} The fast path left ${outcome.mint}'s buy to this bot: ${outcome.reason}.`));
+    } else if (outcome.status === 'failed') {
+      setImmediate(() => warn(`${this.tag} The fast path's buy of ${outcome.mint} was refused (${outcome.reason}); this bot handles the copy buy.`));
+    }
+    this._countCopyTx(tx, slot);
+    const mk = m.marks || {};
+    // Its step times, on its own clock, from the moment his trade arrived.
+    const marks = { t0: 0, parsed: 0, keys: mk.keys, tablesFetched: Boolean(mk.tablesFetched), classified: mk.classified };
+    if (fast) {
+      marks.handler = mk.classified;
+      marks.decide = mk.decide;
+    }
+    const wallet = m.wallet && this.walletSet.has(m.wallet) ? m.wallet : this._signerOf(tx);
+    this._handleTx(tx, slot, m.seenAt, wallet, marks, { fast, keys: Array.isArray(m.keys) ? m.keys : null }).catch((err) => warn(`${this.tag} Couldn't read ${tx.signature}: ${err.message}`));
+  }
+
   // ---- Shreder (ShrederService/SubscribeTransactions) ----
 
   _startShreder() {
@@ -623,6 +719,7 @@ class ShredFeed extends EventEmitter {
     clearTimeout(this.firstStatsTimer);
     clearTimeout(this.reconnectTimer);
     clearInterval(this.pingTimer);
+    clearInterval(this.tablesTimer);
     if (this.ws) {
       try {
         this.ws.close();
@@ -740,22 +837,62 @@ class ShredFeed extends EventEmitter {
     return keys;
   }
 
-  async _handleTx(tx, slot, seenAt, wallet = this.wallet, marks = null) {
+  async _handleTx(tx, slot, seenAt, wallet = this.wallet, marks = null, { fast = null, keys: givenKeys = null } = {}) {
     marks = marks || { t0: performance.now() };
-    const keys = await this._keysFor(tx);
-    marks.keys = performance.now();
-    marks.tablesFetched = Boolean(tx.tablesFetched);
+    const keys = givenKeys || (await this._keysFor(tx));
+    if (!givenKeys) {
+      marks.keys = performance.now();
+      marks.tablesFetched = Boolean(tx.tablesFetched);
+    }
+    if (fast) {
+      // The fast path bought (or rehearsed) it: take it from there.
+      this.emitter._markSeen(tx.signature);
+      this.stats.buys += 1;
+      const sol = typeof fast.copySol === 'number' ? fast.copySol : 0;
+      const via = fast.via || 'Pump.fun';
+      setImmediate(() => info(`${this.tag} Copy wallet${this._who(wallet)} BUY of ${fast.mint} seen early (${via}, ${fast.approx ? '≤' : ''}${sol.toFixed(4)} SOL, slot ${slot}): ${tx.signature}; the fast path ${fast.status === 'bought' ? 'bought' : 'rehearsed'} it.`));
+      this.emitter.emit('copyTrade', {
+        signature: tx.signature,
+        slot,
+        dexs: ['Pump.fun'],
+        ca: fast.mint,
+        trade: 'buy',
+        wallet,
+        solAmount: -sol,
+        solAmountApprox: Boolean(fast.approx),
+        tokenAmount: 0,
+        sellPercent: null,
+        fast: true,
+        shred: true,
+        copyPriceSol: null,
+        fastHint: null,
+        fastSent: fast,
+        seenAt,
+        marks
+      });
+      if (fast.status === 'bought') this._verifyLater(tx.signature, fast.mint, 0, wallet);
+      // Still read for router learning; a problem there can't affect the take-over.
+      try {
+        if (!keys) throw new Error('no keys');
+        const { routerIxs } = classify(tx, keys, wallet, { learner: this.learner, isHeld: (mint) => this.isHeld(mint, wallet) });
+        if (routerIxs.length) {
+          this.stash.set(tx.signature, routerIxs);
+          if (this.stash.size > STASH_MAX) this.stash.delete(this.stash.keys().next().value);
+        }
+      } catch {}
+      return;
+    }
     if (!keys) {
       warn(`${this.tag} ${tx.signature}: couldn't resolve its address lookup tables; leaving it to the websocket feed.`);
       return;
     }
     const { intents, routerIxs } = classify(tx, keys, wallet, { learner: this.learner, isHeld: (mint) => this.isHeld(mint, wallet) });
-    marks.classified = performance.now();
     if (routerIxs.length) {
       this.stash.set(tx.signature, routerIxs);
       if (this.stash.size > STASH_MAX) this.stash.delete(this.stash.keys().next().value);
     }
 
+    if (!givenKeys) marks.classified = performance.now();
     const buy = intents.find((i) => i.side === 'buy' && i.solLamports !== null);
     if (buy) {
       const sol = Number(buy.solLamports) / 1e9;
@@ -905,13 +1042,21 @@ class ShredFeed extends EventEmitter {
  * source is up; 'stopped' once all have stopped).
  */
 class ShredFeeds extends EventEmitter {
-  constructor({ emitter, isHeld, routersFile = ROUTERS_FILE, sources = null, checkStatus = null, verifyDelaysMs = VERIFY_DELAYS_MS, raceOptions = {} } = {}) {
+  constructor({ emitter, isHeld, routersFile = ROUTERS_FILE, sources = null, checkStatus = null, verifyDelaysMs = VERIFY_DELAYS_MS, raceOptions = {}, fastPath = null, fallbackMs = config.FAST_PATH_FALLBACK_MS } = {}) {
     super();
-    this.sources = sources || (config.SHRED_SOURCES && config.SHRED_SOURCES.length ? config.SHRED_SOURCES : [String(config.SHRED_SOURCE || '').split(',')[0] || 'jito-grpc']);
-    const multi = this.sources.length > 1;
-    this.race = multi ? new FeedRace(this.sources, raceOptions) : null;
+    const configured = config.SHRED_SOURCES && config.SHRED_SOURCES.length ? config.SHRED_SOURCES : [String(config.SHRED_SOURCE || '').split(',')[0] || 'jito-grpc'];
+    // FAST_PATH="rust": the fast path reads the feeds; ours stand by in case it's unreachable.
+    this.fastPath = fastPath;
+    this.sources = sources || (fastPath ? ['rust'] : configured);
+    this.standbySources = fastPath ? configured : [];
+    this.fallbackMs = fallbackMs;
+    this.standby = [];
+    const raced = fastPath ? configured : this.sources;
+    const multi = raced.length > 1;
+    this.race = multi ? new FeedRace(raced, raceOptions) : null;
     const learner = new RouterLearner(routersFile);
     const earlyExits = new Set();
+    this.shared = { emitter, isHeld, checkStatus, verifyDelaysMs, learner, earlyExits };
     this.feeds = this.sources.map(
       (source) =>
         new ShredFeed({
@@ -924,7 +1069,8 @@ class ShredFeeds extends EventEmitter {
           learner,
           earlyExits,
           race: this.race,
-          tag: multi ? `[Shreds ${sourceLabel(source)}]` : '[Shreds]'
+          fastPath,
+          tag: source === 'rust' ? '[Shreds]' : multi ? `[Shreds ${sourceLabel(source)}]` : '[Shreds]'
         })
     );
     this.state = undefined;
@@ -937,7 +1083,8 @@ class ShredFeeds extends EventEmitter {
   }
 
   _update(feed, ev, detail) {
-    const states = this.feeds.map((f) => f.state);
+    if (feed.sourceOpt === 'rust') this._fallback(ev);
+    const states = [...this.feeds, ...this.standby].map((f) => f.state);
     const next = states.includes('up') ? 'up' : states.every((x) => x === 'stopped') ? 'stopped' : 'down';
     if (this.feeds.length > 1 && ev !== 'up' && next === 'up') {
       // One source lost while another still works: say so, buying goes on.
@@ -947,6 +1094,46 @@ class ShredFeeds extends EventEmitter {
     this.state = next;
     const why = next === 'stopped' ? this.feeds.map((f) => f.stoppedWhy).filter(Boolean).join('; ') || detail : detail;
     this.emit(next, why);
+  }
+
+  /** FAST_PATH: open our own feeds while the fast path is unreachable, close them once it's back. */
+  _fallback(ev) {
+    if (!this.standbySources.length || this.stopped) return;
+    if (ev === 'up') {
+      clearTimeout(this.fallbackTimer);
+      this.fallbackTimer = null;
+      if (this.standby.length) {
+        info('[Shreds] The fast path is back; closing this bot\'s own shred feed(s).');
+        for (const f of this.standby) {
+          try {
+            f.stop();
+          } catch {}
+        }
+        this.standby = [];
+      }
+      return;
+    }
+    if (this.standby.length || this.fallbackTimer) return;
+    this.fallbackTimer = setTimeout(() => {
+      this.fallbackTimer = null;
+      if (this.stopped || (this.feeds[0] && this.feeds[0].state === 'up')) return;
+      warn(`[Shreds] The fast path has been unreachable for ${Math.round(this.fallbackMs / 1000)}s: this bot opens its own shred feed(s) (${this.standbySources.map(sourceLabel).join(', ')}) until it's back.`);
+      const sh = this.shared;
+      for (const source of this.standbySources) {
+        const f = new ShredFeed({ ...sh, routersFile: null, source, race: null, tag: `[Shreds fallback ${sourceLabel(source)}]` });
+        f.on('stopped', (why) => {
+          f.stoppedWhy = `${sourceLabel(source)}: ${why || 'stopped'}`;
+        });
+        for (const e of ['up', 'down', 'stopped']) f.on(e, (detail) => this._update(f, e, detail));
+        try {
+          f.start();
+          this.standby.push(f);
+        } catch (err) {
+          warn(`[Shreds] Fallback ${sourceLabel(source)} not started: ${err.message}`);
+        }
+      }
+    }, this.fallbackMs);
+    if (this.fallbackTimer.unref) this.fallbackTimer.unref();
   }
 
   start() {
@@ -968,7 +1155,7 @@ class ShredFeeds extends EventEmitter {
     }
     if (!started) throw firstErr;
     if (this.race) {
-      info(`[Shreds] Running ${this.sources.map(sourceLabel).join(' and ')} side by side: the first to report a trade is used; [Race] lines show which was faster.`);
+      info(`[Shreds] Running ${this.race.sources.map(sourceLabel).join(' and ')} side by side${this.fastPath ? ' (read by the fast path)' : ''}: the first to report a trade is used; [Race] lines show which was faster.`);
       const minutes = config.USAGE_LOG_MIN || 10;
       this.raceTimer = setInterval(() => this.race.logSummary(), minutes * 60_000);
       if (this.raceTimer.unref) this.raceTimer.unref();
@@ -978,15 +1165,20 @@ class ShredFeeds extends EventEmitter {
   /** A confirmed copy trade from the websocket feed: learn from the source that stashed its router instructions. */
   learn(event) {
     if (!event || !event.signature) return;
-    const holder = this.feeds.find((f) => f.stash.has(event.signature));
+    const all = [...this.feeds, ...this.standby];
+    const holder = all.find((f) => f.stash.has(event.signature));
     if (!holder) return;
     holder.learn(event);
-    for (const f of this.feeds) f.stash.delete(event.signature);
+    for (const f of all) f.stash.delete(event.signature);
+    // A newly learned router reaches the fast path straight away.
+    if (this.fastPath) this.fastPath.pushRouters();
   }
 
   stop() {
+    this.stopped = true;
     clearInterval(this.raceTimer);
-    for (const f of this.feeds) {
+    clearTimeout(this.fallbackTimer);
+    for (const f of [...this.feeds, ...this.standby]) {
       try {
         f.stop();
       } catch {}
@@ -998,4 +1190,26 @@ class ShredFeeds extends EventEmitter {
   }
 }
 
-module.exports = { ShredFeed, ShredFeeds, parseTarget, heliusPreprocessedUrl };
+/** A transaction as the fast path sends it (byte fields base64) -> the shape parseTransaction returns. */
+function fromRustTx(t) {
+  if (!t || !Array.isArray(t.staticKeys)) throw new Error('fast path transaction without accounts');
+  const b = (x) => Buffer.from(x || '', 'base64');
+  const staticKeys = t.staticKeys.map(b);
+  let size = staticKeys.length * 32;
+  const instructions = (t.instructions || []).map((ix) => {
+    const data = b(ix.data);
+    size += 2 + (ix.accounts || []).length + data.length;
+    return { programIdIndex: ix.programIdIndex, accounts: ix.accounts || [], data };
+  });
+  return {
+    signature: t.signature || null,
+    numSigners: t.numSigners,
+    version: t.version,
+    staticKeys,
+    instructions,
+    lookups: (t.lookups || []).map((l) => ({ key: b(l.key), writable: l.writable || [], readonly: l.readonly || [] })),
+    size: size + 64
+  };
+}
+
+module.exports = { ShredFeed, ShredFeeds, parseTarget, heliusPreprocessedUrl, fromRustTx };

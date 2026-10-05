@@ -764,6 +764,29 @@ module.exports = {
     }
   },
 
+  fast_path_buy_is_taken_over_as_a_position: {
+    env: { TRADE_TYPE: 'SAFE', BUY_AMOUNT: '0.05' },
+    async run(h) {
+      const te = require(require('path').join(process.cwd(), 'src', 'tradeExecutor.js'));
+      const m = h.newMint();
+      h.ledger.prices.set(m, 0.001);
+      const sig = await te.simulateFastBuy(m, 0.05);
+      const fastSent = { status: 'bought', signature: sig, mint: m, amountSol: 0.05, copySol: 1.2, buildMs: 0.31, sendMs: 1.7, sentAt: Date.now(), via: 'Pump.fun', guard: null, compute: null };
+      h.buy(m, 1.2, { shred: true, seenAt: Date.now() - 3, fastSent, marks: { t0: 0, parsed: 0, keys: 0.05, classified: 0.1, handler: 0.1, decide: 0.12 } });
+      const pos = await h.waitFor(() => h.active().find((p) => p.mint === m), 'position opened from the fast path buy');
+      h.check(pos && pos.buy_signature === sig, `the fast path's signature is the position's buy (${pos && pos.buy_signature})`);
+      h.check(h.ledger.calls.buy.length === 0, 'this bot did not buy it again');
+      h.check(h.ledger.calls.external === 1, 'recorded as an external buy (timing, guard, compute)');
+      h.check(h.logs.some((l) => l.includes('The Rust fast path bought 0.05 SOL')), 'logged as bought by the fast path');
+      // Rehearsed (paused) by the fast path: a timing line, nothing else.
+      const m2 = h.newMint();
+      h.buy(m2, 1.0, { shred: true, seenAt: Date.now() - 2, slot: 9900, fastSent: { status: 'rehearsed', mint: m2, amountSol: 0.05, buildMs: 0.28, readyMs: 0.4 }, marks: { t0: 0, parsed: 0, keys: 0.05, classified: 0.1, handler: 0.1, decide: 0.12 } });
+      await h.sleep(300);
+      h.check(h.logs.some((l) => l.includes('[Timing] REHEARSAL') && l.includes('(Rust fast path)')), 'rehearsal timing line');
+      h.check(!h.active().some((p) => p.mint === m2) && h.ledger.calls.buy.length === 0, 'no position, nothing bought');
+    }
+  },
+
   paused_bot_rehearses_shred_buys_without_sending: {
     env: { START_PAUSED: 'true', MAX_SLOTS_BEHIND: '0', TELEGRAM_BOT_TOKEN: 'test-token', TELEGRAM_CHAT_ID: '777' },
     async run(h) {

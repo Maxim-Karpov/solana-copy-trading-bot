@@ -834,4 +834,4 @@ async function prepareHandBuilt(user) {
   }
 }
 
-module.exports = { prepareHandBuilt, recipientsOf, buildQuoteBuy, quoteBudget, minTokensAtMcap, buildPumpfunBuyTx, buildPumpfunSellTx, UnsupportedPumpfunTradeError, mintTokenProgram, mintDetails, warmFeeConfig, warmUpBuild, onlineSdkFor, curveState, stateFromHint, _resetForTests };
+module.exports = { worstFeeBpsFor: worstFeeBps, prepareHandBuilt, recipientsOf, buildQuoteBuy, quoteBudget, minTokensAtMcap, buildPumpfunBuyTx, buildPumpfunSellTx, UnsupportedPumpfunTradeError, mintTokenProgram, mintDetails, warmFeeConfig, warmUpBuild, onlineSdkFor, curveState, stateFromHint, _resetForTests };

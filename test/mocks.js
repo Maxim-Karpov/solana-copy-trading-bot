@@ -105,6 +105,17 @@ function installMocks(rootDir, walletAddress) {
   // ---- tradeExecutor mock ----
   const tradeExecutor = {
     buyTiming: (sig) => ledger.buyTimings.get(sig) || null,
+    // FAST_PATH="rust": a buy the fast path sent, recorded here.
+    noteExternalBuy(sig, t) {
+      ledger.calls.external = (ledger.calls.external || 0) + 1;
+      ledger.buyTimings.set(sig, { buildMs: t.buildMs, sendMs: t.sendMs, sentAt: t.sentAt });
+    },
+    // For tests: settle a buy as the fast path would have sent it (not counted as ours).
+    async simulateFastBuy(mint, amountSol) {
+      const sig = await tradeExecutor.buyToken({ mint, amountSol, tip: 0 });
+      ledger.calls.buy.pop();
+      return sig;
+    },
     async buyToken(args) {
       if (args.dryRun) {
         // Rehearsal (paused): built and signed, nothing sent.

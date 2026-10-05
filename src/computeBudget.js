@@ -187,4 +187,15 @@ function wasLearned(signature) {
   return Boolean(s && s.learned);
 }
 
-module.exports = { kindOf, estimate, setLimit, limitOf, fit, remember, observe, ranOut, wasLearned, MIN_SAMPLES, _resetForTests };
+/** Every learned limit, for the Rust fast path: { kind: limit }. */
+function allEstimates(ceiling) {
+  load();
+  const out = {};
+  for (const k of kinds.keys()) {
+    const e = estimate(k, ceiling);
+    if (e) out[k] = e;
+  }
+  return out;
+}
+
+module.exports = { allEstimates, kindOf, estimate, setLimit, limitOf, fit, remember, observe, ranOut, wasLearned, MIN_SAMPLES, _resetForTests };

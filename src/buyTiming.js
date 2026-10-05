@@ -8,6 +8,11 @@
 const slotClock = require('./slotClock');
 const leaderInfo = require('./leaderInfo');
 
+// Times from the Rust fast path have fractions of a millisecond.
+const fmt = (x) => (typeof x === 'number' && !Number.isInteger(x) ? (x < 10 ? x.toFixed(2) : x.toFixed(1)) : x);
+
+const rnd = (x) => (typeof x === 'number' ? Math.round(x) : x);
+
 const runs = []; // { outcome, sentInto, seenToSentMs, band }
 let skippedFar = 0; // buys not sent: the slot leader was too far (LEADER_MAX_KM)
 
@@ -30,8 +35,8 @@ const median = (xs) => {
  */
 function record({ mint, outcome, hisSlot, ourSlot, seenAt, decideAt, timing, failure = '', leader = null, marks = null }) {
   const sentAt = timing && timing.sentAt;
-  const seenInto = typeof hisSlot === 'number' && seenAt ? slotClock.msInto(hisSlot, seenAt) : null;
-  const sentInto = typeof hisSlot === 'number' && sentAt ? slotClock.msInto(hisSlot, sentAt) : null;
+  const seenInto = typeof hisSlot === 'number' && seenAt ? rnd(slotClock.msInto(hisSlot, seenAt)) : null;
+  const sentInto = typeof hisSlot === 'number' && sentAt ? rnd(slotClock.msInto(hisSlot, sentAt)) : null;
   const est = typeof hisSlot === 'number' && slotClock.startOf(hisSlot) && slotClock.startOf(hisSlot).estimated;
   const seenToSentMs = sentAt && seenAt ? sentAt - seenAt : null;
   runs.push({ outcome, sentInto, seenToSentMs, band: leaderInfo.band(leader) });
@@ -46,8 +51,8 @@ function record({ mint, outcome, hisSlot, ourSlot, seenAt, decideAt, timing, fai
     const split = decidingSteps(marks);
     if (split) steps.push(split);
     else if (decideAt && seenAt) steps.push(`deciding ${decideAt - seenAt}`);
-    if (timing && typeof timing.buildMs === 'number') steps.push(`building ${timing.buildMs}`);
-    parts.push(`${seenToSentMs} ms from seeing to sending (${steps.join('; ')} ms; Sender answered in ${timing.sendMs} ms)`);
+    if (timing && typeof timing.buildMs === 'number') steps.push(`building ${fmt(timing.buildMs)}`);
+    parts.push(`${fmt(seenToSentMs)} ms from seeing to sending (${steps.join('; ')} ms; Sender answered in ${fmt(timing.sendMs)} ms)`);
   }
   if (leader) parts.push(leaderInfo.describe(leader));
   const result =
@@ -91,7 +96,7 @@ function summary() {
   const pct = Math.round((100 * inBlock.length) / n);
   let s = `In his block this run: ${inBlock.length} of ${n} (${pct}%)`;
   const m = median(runs.map((r) => r.seenToSentMs));
-  if (m !== null) s += `; median seeing→sending ${m} ms`;
+  if (m !== null) s += `; median seeing→sending ${fmt(m)} ms`;
   const mIn = median(inBlock.map((r) => r.sentInto));
   const mLate = median(late.map((r) => r.sentInto));
   if (mIn !== null && mLate !== null) s += `; sent at median ${mIn} ms into his slot when we made it, ${mLate} ms when we didn't`;
@@ -122,8 +127,8 @@ const rehearsals = []; // seen -> ready-to-send, ms (PAUSED_REHEARSAL)
 function rehearsal({ mint, hisSlot, seenAt, decideAt, result, marks = null, leader = null }) {
   const readyAt = result && result.readyAt;
   const parts = [];
-  const seenInto = typeof hisSlot === 'number' && seenAt ? slotClock.msInto(hisSlot, seenAt) : null;
-  const readyInto = typeof hisSlot === 'number' && readyAt ? slotClock.msInto(hisSlot, readyAt) : null;
+  const seenInto = typeof hisSlot === 'number' && seenAt ? rnd(slotClock.msInto(hisSlot, seenAt)) : null;
+  const readyInto = typeof hisSlot === 'number' && readyAt ? rnd(slotClock.msInto(hisSlot, readyAt)) : null;
   const est = typeof hisSlot === 'number' && slotClock.startOf(hisSlot) && slotClock.startOf(hisSlot).estimated;
   if (seenInto !== null) parts.push(`his trade reached the bot ${seenInto} ms into his slot${est ? ' (estimated)' : ''}, ours was ready to send at ${readyInto} ms`);
   const total = readyAt && seenAt ? readyAt - seenAt : null;
@@ -134,15 +139,15 @@ function rehearsal({ mint, hisSlot, seenAt, decideAt, result, marks = null, lead
     const split = decidingSteps(marks);
     if (split) steps.push(split);
     else if (decideAt && seenAt) steps.push(`deciding ${decideAt - seenAt}`);
-    if (typeof result.buildMs === 'number') steps.push(`building ${result.buildMs}`);
-    if (typeof result.signMs === 'number') steps.push(`signing ${result.signMs}`);
-    parts.push(`${total} ms from seeing to ready-to-send (${steps.join('; ')} ms)`);
+    if (typeof result.buildMs === 'number') steps.push(`building ${fmt(result.buildMs)}`);
+    if (typeof result.signMs === 'number') steps.push(`signing ${fmt(result.signMs)}`);
+    parts.push(`${fmt(total)} ms from seeing to ready-to-send (${steps.join('; ')} ms)`);
   }
   if (leader) parts.push(leaderInfo.describe(leader));
   const m = median(rehearsals);
   return (
     `[Timing] REHEARSAL (paused, not sent) ${mint.slice(0, 4)}…${mint.slice(-4)}: ${parts.join('; ')}.` +
-    (m !== null ? ` Rehearsals this run: ${rehearsals.length}; median seeing→ready ${m} ms.` : '')
+    (m !== null ? ` Rehearsals this run: ${rehearsals.length}; median seeing→ready ${fmt(m)} ms.` : '')
   );
 }
 

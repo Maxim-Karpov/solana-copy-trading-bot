@@ -6,11 +6,11 @@
 
 ![Node.js](https://img.shields.io/badge/node-%E2%89%A518.17-339933?logo=node.js&logoColor=white)
 ![Solana](https://img.shields.io/badge/Solana-mainnet-9945FF?logo=solana&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-165%20passing-2ea44f)
-![Version](https://img.shields.io/badge/version-3.28.0-blue)
+![Tests](https://img.shields.io/badge/tests-168%20passing-2ea44f)
+![Version](https://img.shields.io/badge/version-3.29.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-[Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Speed](#-built-for-speed) · [Telegram](#-telegram-control) · [Full reference](docs/REFERENCE.md)
+[Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Speed](#-built-for-speed) · [Rust fast path](#-rust-fast-path) · [Telegram](#-telegram-control) · [Full reference](docs/REFERENCE.md)
 
 </div>
 
@@ -70,7 +70,7 @@ nano .env               # RPC, wallet, copy wallets, mode, limits
 
 # 3. Check and run
 npm run check-env       # missing or misspelt settings (never prints values)
-npm test                # 165 tests, fully simulated, no network or funds
+npm test                # 168 tests, fully simulated, no network or funds
 npm start
 ```
 
@@ -114,6 +114,7 @@ On top of any mode:
 | Feed race | `SHRED_SOURCE="shreder,helius-preprocessed"` | `[Race]` line per trade: who was first and by how many ms |
 | No-lookup buys | `SHRED_FAST_BUY` | Builds Pump.fun buys straight from the shred data, with the price capped on-chain by `MAX_MARKET_CAP_SOL` |
 | Hand-built buys | `HAND_BUILT_BUYS` (on) | Writes those buys straight into transaction bytes: ~0.3 ms to build and sign instead of ~2 ms, checked byte-identical to the SDK's |
+| Rust fast path | `FAST_PATH="rust"` | A Rust program reads the shred feeds and builds, signs and sends those buys in ~0.05 ms; this bot does everything else ([setup](#-rust-fast-path)) |
 | Sender | `SEND_VIA="sender"`, `SENDER_TIP` | Helius Sender, which sends via Jito and staked connections at once |
 | Buy fees | `BUY_PRIORITY_FEE_SOL` | Higher priority fee for buys racing snipers; sells pay less |
 | Compute budget | `AUTO_COMPUTE_UNITS`, `PUMPFUN_COMPUTE_UNITS` | Learns each trade kind's real usage, so the same fee buys a higher fee per CU |
@@ -126,6 +127,40 @@ On top of any mode:
 - **`[Host]` lines** report event-loop delay and stolen CPU, which tell you whether the server is the bottleneck.
 - **`npm run leaders`** checks which of your past buys made the copy wallet's block, grouped by leader location and ping.
 - **`npm run shreder-check`** proves a Shreder endpoint is reachable from this server in 20 seconds.
+
+---
+
+## 🦀 Rust fast path
+
+The race part of the bot, in Rust (`fastpath/`). It reads the shred feeds itself, spots the copy wallet's Pump.fun buy, decides from the state the Node bot keeps sending it, then builds, signs and sends the buy. Build and sign take **~0.04 ms**, against ~0.3 ms for the hand-built Node buy and ~2 ms for the SDK. There are no garbage-collection pauses. Everything else stays in Node: positions, sells, instant sells, Telegram, and any buy the fast path isn't sure about.
+
+**Safe by design**
+- **Checked before it buys.** It buys only after building a practice buy that is byte-identical to the Node bot's. The check runs at startup and again every 30 s.
+- **Fresh state only.** It needs a state snapshot under 1.5 s old; otherwise it leaves the buy to Node.
+- **When in doubt, Node decides.** Anything else it's unsure of (an unknown router, a PumpSwap coin, a cap reached…) also goes to the Node bot, which handles it and says why, as before.
+- **Falls back if it goes away.** If it stops, the Node bot opens its own shred feed after 5 s.
+
+**Set up (once):**
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+sudo apt install -y build-essential
+cd fastpath && cargo build --release && cd ..     # 2–5 min the first time
+```
+Then add `FAST_PATH="rust"` to `.env`, alongside `SHRED_FAST_BUY="true"`, `DIRECT_PUMPFUN_SWAP="true"` and `SHRED_SOURCE` with `shreder` and/or `helius-preprocessed`.
+
+**Run:**
+- **pm2:** `pm2 start ecosystem.config.js` starts both. Logs: `pm2 logs fastpath`.
+- **No pm2:** run `./fastpath/target/release/fastpath` in one window and `npm start` in another.
+
+**Update:**
+```bash
+unzip -o solana-copy-trading-bot-tiered.zip      # or: git pull
+npm install && (cd fastpath && cargo build --release)
+pm2 restart all                                  # or restart both windows
+```
+
+The first log line to look for is `[FastPath] The Rust fast path's buy is identical to this bot's, byte for byte`. Every buy it makes is logged with its timing: `BUY sent … 0.xx ms from seeing his buy to sending ours`.
 
 ---
 
@@ -164,7 +199,8 @@ src/
 ├── index.js            main loop: copy trades → checks → buys/sells → positions
 ├── config.js           loads and validates every setting
 ├── websocket.js        RPC websocket feed (logs or transaction subscribe)
-├── shredFeed.js        shred feeds: Helius preprocessed, Shreder, Jito gRPC; side by side
+├── shredFeed.js        shred feeds: Helius preprocessed, Shreder, Jito gRPC, the Rust fast path
+├── fastPath.js         the link with the Rust fast path
 ├── feedRace.js         which shred feed reported each trade first
 ├── shredTx.js          reads legacy / v0 / v1 transactions from shreds
 ├── shredDecode.js      Pump.fun / PumpSwap / router trade intents, router learning
@@ -181,6 +217,7 @@ src/
 ├── hostStats.js        [Host] lines: event loop and CPU
 ├── telegramBot.js      Telegram control and notifications
 └── storage.js          positions on disk
+fastpath/               the Rust fast path (cargo build --release)
 scripts/                check-env · leaders · shreder-check
 test/                   unit + end-to-end tests (network simulated)
 docs/REFERENCE.md       every setting and feature in detail

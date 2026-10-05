@@ -237,7 +237,13 @@ function _setForTests(mint, state) {
   tokens.set(mint, { mint, label: label(mint), program: TOKEN_PROGRAM_ID, decimals: 6, lamportsPerRaw: null, priceAt: Date.now(), balanceRaw: 0n, balanceAt: Date.now(), reservedRaw: 0n, topUp: null, ...state });
 }
 
+/** Quote-token mints known so far (for the Rust fast path). */
+function knownQuoteMintList() {
+  return [...knownQuoteMints];
+}
+
 module.exports = {
+  knownQuoteMintList,
   enabled,
   get,
   lamportsPerRaw,

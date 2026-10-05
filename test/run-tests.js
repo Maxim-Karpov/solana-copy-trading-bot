@@ -132,7 +132,8 @@ function tail(out, n = 40) {
       SOLANA_RPC_FALLBACKS: 'http://127.0.0.1:2,http://127.0.0.1:3',
       SOLANA_WS: 'ws://127.0.0.1:18765',
       __WS_PORT: '18765',
-      DIRECT_PUMPFUN_SWAP: 'true'
+      DIRECT_PUMPFUN_SWAP: 'true',
+      __FASTPATH_BIN: path.join(repo, 'fastpath', 'target', 'release', process.platform === 'win32' ? 'fastpath.exe' : 'fastpath')
     };
     const { parsed, out } = await runChild('unit.js', [], unitEnv, '__UNIT__');
     if (!parsed) {

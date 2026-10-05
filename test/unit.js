@@ -1466,6 +1466,224 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     });
   }
 
+  {
+    const bin = process.env.__FASTPATH_BIN;
+    const have = bin && fs.existsSync(bin);
+    await test(`FAST_PATH=rust: the Rust fast path checks out byte for byte, then buys from the shred feed itself${have ? '' : ' (SKIPPED: fastpath not built)'}`, async () => {
+      if (!have) return;
+      const script = `
+        const http = require('http');
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const crypto = require('crypto');
+        const { spawn } = require('child_process');
+        const { WebSocketServer } = require('ws');
+        const BN = require('bn.js');
+        const { PublicKey, Keypair, VersionedTransaction, TransactionMessage, TransactionInstruction } = require('@solana/web3.js');
+        const { TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync } = require('@solana/spl-token');
+        const bs58 = require('bs58').default || require('bs58');
+        const sdk = require('@pump-fun/pump-sdk');
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const waitFor = async (fn, ms = 8000) => { const t = Date.now(); while (Date.now() - t < ms) { const v = fn(); if (v) return v; await sleep(25); } return null; };
+        const feeRecipient = Keypair.generate().publicKey, reserved = Keypair.generate().publicKey;
+        const pumpGlobal = {
+          initialVirtualTokenReserves: new BN('1073000000000000'), initialVirtualSolReserves: new BN('30000000000'),
+          initialRealTokenReserves: new BN('793100000000000'), tokenTotalSupply: new BN('1000000000000000'),
+          feeBasisPoints: new BN(95), creatorFeeBasisPoints: new BN(30), creatorFeeConfigurable: false, mayhemModeEnabled: false,
+          feeRecipient, feeRecipients: [], reservedFeeRecipient: reserved, reservedFeeRecipients: [reserved]
+        };
+        const tier = { marketCapLamportsThreshold: new BN(0), fees: { lpFeeBps: new BN(0), protocolFeeBps: new BN(95), creatorFeeBps: new BN(30) } };
+        sdk.OnlinePumpSdk.prototype.fetchFeeConfig = async () => ({ feeTiers: [tier], stableFeeTiers: [], flatFees: tier.fees, exoticFlatFees: tier.fees });
+        (async () => {
+          const out = {};
+          // Stand-ins: the Helius preprocessed feed, Helius Sender, the RPC.
+          const wss = new WebSocketServer({ port: 0 });
+          await new Promise((r) => wss.on('listening', r));
+          let feedSock = null;
+          wss.on('connection', (sock) => sock.on('message', () => { feedSock = sock; sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, result: 5 })); }));
+          const sent = [];
+          const srv = http.createServer((req, res) => {
+            let body = ''; req.on('data', (c) => (body += c));
+            req.on('end', () => {
+              if (req.url.startsWith('/ping')) { res.end('ok'); return; }
+              let j = {}; try { j = JSON.parse(body); } catch {}
+              if (j.method === 'sendTransaction') {
+                const raw = Buffer.from(j.params[0], 'base64');
+                sent.push({ url: req.url, raw, at: Date.now() });
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: bs58.encode(VersionedTransaction.deserialize(raw).signatures[0]) }));
+                return;
+              }
+              res.end(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: null }));
+            });
+          });
+          await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+          const httpPort = srv.address().port;
+          const linkPort = 20000 + Math.floor(Math.random() * 20000);
+          const env = { ...process.env, FAST_PATH: 'rust', FAST_PATH_PORT: String(linkPort), SHRED_SOURCE: 'helius-preprocessed', SHRED_STREAM_URL: 'ws://127.0.0.1:' + wss.address().port,
+            SEND_VIA: 'sender', SENDER_ENDPOINT: 'http://127.0.0.1:' + httpPort + '/fast', SOLANA_RPC: 'http://127.0.0.1:' + httpPort };
+          Object.assign(process.env, env);
+          const envFile = path.join(os.tmpdir(), 'fastpath-test-' + process.pid + '.env');
+          fs.writeFileSync(envFile, Object.entries(env).filter(([k]) => /^[A-Z_]+$/.test(k)).map(([k, v]) => k + '=' + JSON.stringify(String(v))).join('\\n'));
+          const rust = spawn(${JSON.stringify(bin)}, [], { env: { ...env, FASTPATH_ENV: envFile }, stdio: ['ignore', 'pipe', 'pipe'] });
+          let rustLog = '';
+          rust.stdout.on('data', (d) => (rustLog += d));
+          rust.stderr.on('data', (d) => (rustLog += d));
+          try {
+            const prewarm = require('./src/prewarm');
+            const d = require('./src/pumpfunDirect');
+            const config = require('./src/config');
+            const { FastPath } = require('./src/fastPath');
+            prewarm._setForTests({ blockhash: 'GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi', pumpGlobal });
+            await d.warmFeeConfig({});
+            const copyWallet = new PublicKey(config.COPY_WALLET);
+            let buying = true;
+            const state = () => ({
+              buying, rehearse: !buying, fastBuy: true, onlyFirstBuy: false,
+              wallets: { [copyWallet.toBase58()]: { allowed: true, holdingsLoaded: true, held: [], exited: [] } },
+              positions: [], sizing: { mode: 'fixed', fixed: 0.05 }, minTradeSol: 0.003, minCopyBuySol: null, maxBuySol: 11, roomSol: 15,
+              spendableSol: 5, cooldownMs: 0, lastBuyAt: 0, openSlots: null, maxMcapSol: 300, minMcapSet: false, blockedVaults: [], quoteMints: [], quotePrefixes: [],
+              maxSlotsBehind: 1, guardAvailable: true, farSlots: [], fees: { buyFeeSol: 0.0015, buyFeePct: 0, useSender: true, senderTip: config.SENDER_TIP, jitoTip: config.JITO_TIP, ceiling: config.PUMPFUN_COMPUTE_UNITS },
+              computeLimits: {}
+            });
+            let fp = new FastPath({ port: linkPort, stateProvider: state });
+            const txs = [];
+            const claims = [];
+            fp.on('tx', (m) => txs.push(m));
+            fp.on('claim', (m) => { claims.push(m.his); out.claimAmount = m.amountSol; });
+            fp.start();
+            out.linked = !!(await waitFor(() => fp.hello, 10000));
+            out.verified = !!(await waitFor(() => fp.verified, 8000));
+            out.feedUp = !!(await waitFor(() => feedSock && fp.isUp(), 8000));
+            // His buy: buy_exact_sol_in, with the curve's accounts in it.
+            const vault = sdk.creatorVaultPda(Keypair.generate().publicKey);
+            const meta = (pubkey, w = false) => ({ pubkey, isSigner: false, isWritable: w });
+            const data = Buffer.alloc(25); Buffer.from('38fc74089edfcd5f', 'hex').copy(data); data.writeBigUInt64LE(400000000n, 8); data.writeBigUInt64LE(1n, 16);
+            const buyIx = (mint) => {
+              const curve = sdk.bondingCurvePda(mint);
+              const keys = Array.from({ length: 18 }, () => meta(Keypair.generate().publicKey));
+              keys[1] = meta(feeRecipient, true); keys[2] = meta(mint); keys[3] = meta(curve, true);
+              keys[4] = meta(getAssociatedTokenAddressSync(mint, curve, true, TOKEN_2022_PROGRAM_ID), true);
+              keys[6] = { pubkey: copyWallet, isSigner: true, isWritable: true }; keys[8] = meta(TOKEN_2022_PROGRAM_ID); keys[9] = meta(vault, true);
+              keys[16] = meta(sdk.bondingCurveV2Pda(mint));
+              return new TransactionInstruction({ programId: new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'), keys, data });
+            };
+            const mint1 = Keypair.generate().publicKey;
+            const ix = buyIx(mint1);
+            const frame = (ixs, slot) => {
+              const vt = new VersionedTransaction(new TransactionMessage({ payerKey: copyWallet, recentBlockhash: '11111111111111111111111111111111', instructions: ixs }).compileToLegacyMessage());
+              vt.signatures[0] = crypto.randomBytes(64);
+              return { buf: Buffer.concat([Buffer.from([1]), (() => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(slot)); return b; })(), Buffer.from(vt.signatures[0]), Buffer.from(vt.serialize())]), sig: bs58.encode(vt.signatures[0]) };
+            };
+            const f1 = frame([ix], 5000);
+            feedSock.send(f1.buf);
+            const m1 = await waitFor(() => txs.find((t) => t.signature === f1.sig));
+            out.status = m1 && m1.outcome.status;
+            out.reason = m1 && m1.outcome.reason;
+            const s1 = await waitFor(() => sent[0]);
+            if (s1) {
+              const tx = VersionedTransaction.deserialize(s1.raw);
+              const spki = Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), new PublicKey(config.PUBLIC_KEY).toBuffer()]);
+              out.verifies = crypto.verify(null, Buffer.from(tx.message.serialize()), crypto.createPublicKey({ key: spki, format: 'der', type: 'spki' }), Buffer.from(tx.signatures[0]));
+              const k = tx.message.staticAccountKeys.map(String);
+              const buy = tx.message.compiledInstructions.find((c) => k[c.programIdIndex] === '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+              out.spend = buy && Buffer.from(buy.data).readBigUInt64LE(8).toString();
+              out.vaultOk = buy && k[buy.accountKeyIndexes[9]] === vault.toBase58();
+              out.guarded = tx.message.compiledInstructions.some((c) => k[c.programIdIndex] === 'L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95' && Buffer.from(c.data).readBigUInt64LE(3) === 5001n);
+              out.sigMatches = m1 && m1.outcome.signature === bs58.encode(tx.signatures[0]);
+              out.toSender = s1.url.startsWith('/fast');
+              out.readyMs = m1 && m1.marks && m1.marks.signed;
+            }
+            // The same transaction again (repeat): not bought twice.
+            feedSock.send(f1.buf);
+            await sleep(300);
+            out.sentOnce = sent.length === 1;
+            // His second buy of the same coin while ours is still in flight (not yet taken over): left to this bot.
+            const f1b = frame([buyIx(mint1)], 5002);
+            feedSock.send(f1b.buf);
+            const m1b = await waitFor(() => txs.find((t) => t.signature === f1b.sig));
+            out.secondSameCoin = m1b && m1b.outcome.status + ': ' + m1b.outcome.reason;
+            out.claimed = claims.includes(f1.sig);
+            // The link drops before this bot acknowledged the buy: resent on reconnect.
+            fp.stop();
+            await sleep(200);
+            const fp2 = new FastPath({ port: linkPort, stateProvider: state });
+            const txs2 = [];
+            fp2.on('tx', (m) => txs2.push(m));
+            fp2.start();
+            const again = await waitFor(() => txs2.find((t) => t.signature === f1.sig && t.resent));
+            out.resent = Boolean(again && again.outcome.status === 'bought' && again.outcome.signature === m1.outcome.signature);
+            out.feedsInHello = Boolean(await waitFor(() => fp2.hello && fp2.isUp(), 3000));
+            fp2.ack(m1.outcome.signature);
+            fp2.saved(m1.outcome.signature);
+            await sleep(200);
+            fp2.stop();
+            await sleep(100);
+            const fp3 = new FastPath({ port: linkPort, stateProvider: state });
+            const txs3 = [];
+            fp3.on('tx', (m) => txs3.push(m));
+            fp3.start();
+            await waitFor(() => fp3.hello, 3000);
+            await sleep(300);
+            out.notResentAfterAck = !txs3.some((t) => t.resent);
+            fp3.stop();
+            // Paused with rehearsals: built and signed, not sent.
+            fp = new FastPath({ port: linkPort, stateProvider: state });
+            fp.on('tx', (m) => txs.push(m));
+            fp.start();
+            await waitFor(() => fp.hello && fp.verified, 8000);
+            buying = false; fp.pushState(); await sleep(100);
+            const f2 = frame([buyIx(Keypair.generate().publicKey)], 5100);
+            feedSock.send(f2.buf);
+            const m2 = await waitFor(() => txs.find((t) => t.signature === f2.sig));
+            out.rehearsed = m2 && m2.outcome.status;
+            out.rehearsedWhy = m2 && m2.outcome.reason;
+            await sleep(200);
+            out.notSentWhilePaused = sent.length === 1;
+            // Something it can't buy (a transfer): handed to the Node bot as "none".
+            buying = true; fp.pushState();
+            const f3 = frame([require('@solana/web3.js').SystemProgram.transfer({ fromPubkey: copyWallet, toPubkey: Keypair.generate().publicKey, lamports: 1000 })], 5200);
+            feedSock.send(f3.buf);
+            const m3 = await waitFor(() => txs.find((t) => t.signature === f3.sig));
+            out.transfer = m3 && m3.outcome.status;
+            fp.stop();
+          } catch (e) {
+            out.err = e.stack;
+          } finally {
+            rust.kill();
+            wss.close(); srv.close();
+            try { fs.unlinkSync(envFile); } catch {}
+          }
+          out.rustLog = rustLog.slice(-1500);
+          console.log(JSON.stringify(out));
+          process.exit(0);
+        })();
+      `;
+      const env = { ...process.env, SHRED_FAST_BUY: 'true', MAX_MARKET_CAP_SOL: '300', BUY_PRIORITY_FEE_SOL: '0.0015', PUMPFUN_COMPUTE_UNITS: '130000', SENDER_TIP: '0.0016', MAX_SLOTS_BEHIND: '1' };
+      const r = spawnSync(process.execPath, ['-e', script], { cwd: root, env, encoding: 'utf8', timeout: 60000 });
+      const line = (r.stdout || '').trim().split('\n').filter((l) => l.startsWith('{')).pop() || '';
+      let out = null;
+      try { out = JSON.parse(line); } catch {}
+      check(out, `ran (${(r.stdout || '').slice(-1500)}${(r.stderr || '').slice(-1500)})`);
+      if (!out) return;
+      const ctx = ` [${out.err || ''} | rust: ${out.rustLog}]`;
+      check(out.linked && out.verified && out.feedUp, `linked, checked identical, feed up (${out.linked}, ${out.verified}, ${out.feedUp})${ctx}`);
+      check(out.status === 'bought', `bought it (${out.status}: ${out.reason})${ctx}`);
+      check(out.verifies && out.sigMatches && out.toSender, 'signed by the wallet, sent to Sender, reported with its signature');
+      check(out.spend === '50000000' && out.vaultOk && out.guarded, `0.05 SOL buy_exact_sol_in, his creator vault, slot guard at his slot + 1 (${out.spend}, ${out.vaultOk}, ${out.guarded})`);
+      check(out.sentOnce, 'a repeated transaction is not bought twice');
+      check(/declined: our own buy of this coin is still in flight/.test(out.secondSameCoin || ''), `a second buy of the same coin waits for the first (${out.secondSameCoin})`);
+      check(out.claimed, 'claimed his transaction before sending');
+      check(out.resent && out.feedsInHello, `an unacknowledged buy is resent after a reconnect, feed states come with the hello (${out.resent}, ${out.feedsInHello})`);
+      check(out.notResentAfterAck, 'not resent once the position is saved');
+      check(out.claimAmount === 0.05, `the claim carries the amount, so this bot counts it at once (${out.claimAmount})`);
+      check(out.rehearsed === 'rehearsed' && out.notSentWhilePaused, `paused: rehearsed, nothing sent (${out.rehearsed}: ${out.rehearsedWhy})`);
+      check(out.transfer === 'none', `a transfer is left to the Node bot (${out.transfer})`);
+      check(typeof out.readyMs === 'number' && out.readyMs < 50, `ready to send within milliseconds of his trade arriving (${out.readyMs} ms)`);
+    });
+  }
+
   await test('SHRED_FAST_BUY: buy_exact_sol_in built from the shred transaction alone, max market cap enforced on-chain', async () => {
     const script = `
       const BN = require('bn.js');
@@ -2515,6 +2733,72 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
       Object.assign(config, { SHRED_SOURCE: saved.s, SHRED_SOURCES: saved.ss, SHREDER_URL: saved.u, SHRED_STREAM_URL: saved.su, TRADE_TYPE: saved.t, FULL_EXIT_ON_COPY_SELL: saved.fe });
     }
     check(lines.some((l) => l.startsWith('[Race] Whole run:')), 'whole-run summary at stop');
+  });
+
+  await test('FAST_PATH=rust: its transactions reach the bot (bought ones taken over, the rest handled here); own feed opens if it is unreachable', async () => {
+    const EventEmitter = require('events');
+    const { WebSocketServer } = require('ws');
+    const config = require(src('config.js'));
+    const { ShredFeeds } = require(src('shredFeed.js'));
+    const { parseTransaction } = require(src('shredTx.js'));
+    const f = shredFx;
+    const bs = require('bs58').default || require('bs58');
+    const toRust = (t) => {
+      const { tx } = parseTransaction(t.bytes, 0);
+      return {
+        signature: tx.signature, numSigners: tx.numSigners, version: tx.version,
+        staticKeys: tx.staticKeys.map((k) => Buffer.from(k).toString('base64')),
+        instructions: tx.instructions.map((ix) => ({ programIdIndex: ix.programIdIndex, accounts: ix.accounts, data: Buffer.from(ix.data).toString('base64') })),
+        lookups: []
+      };
+    };
+    const fp = new EventEmitter();
+    fp.feedStates = new Map();
+    fp.connected = false;
+    fp.isUp = () => fp.connected && [...fp.feedStates.values()].includes('up');
+    fp.pushTables = () => {};
+    fp.pushRouters = () => {};
+    // A standby Helius feed (used only while the fast path is unreachable).
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise((r) => wss.on('listening', r));
+    let standbySubs = 0;
+    wss.on('connection', (sock) => sock.on('message', () => { standbySubs += 1; sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, result: 3 })); }));
+    const saved = { s: config.SHRED_SOURCE, ss: config.SHRED_SOURCES, u: config.SHRED_STREAM_URL };
+    Object.assign(config, { SHRED_SOURCE: 'helius-preprocessed', SHRED_SOURCES: ['helius-preprocessed'], SHRED_STREAM_URL: `ws://127.0.0.1:${wss.address().port}` });
+    const em = f.fakeEmitter();
+    const feeds = new ShredFeeds({ emitter: em, routersFile: null, verifyDelaysMs: [], fastPath: fp, fallbackMs: 200, isHeld: () => false });
+    try {
+      feeds.start();
+      check(feeds.feeds[0].source === 'rust' && feeds.feeds[0].state === 'down', 'reads from the fast path, down until it links');
+      const t0 = Date.now();
+      while (!standbySubs && Date.now() - t0 < 3000) await sleep(30);
+      check(standbySubs === 1 && feeds.standby.length === 1, `unreachable: its own Helius feed opened (${standbySubs})`);
+      fp.connected = true;
+      fp.feedStates.set('helius-preprocessed', 'up');
+      fp.emit('linked');
+      await sleep(100);
+      check(feeds.standby.length === 0 && feeds.state === 'up', `linked: own feed closed again (${feeds.standby.length}, ${feeds.state})`);
+      // Bought by the fast path: taken over, not bought again here.
+      const m1 = f.rnd();
+      const t1 = f.txBytes([f.pumpIx(DISC.buyExactSolIn, m1, 400_000_000, 1)]);
+      fp.emit('tx', { source: 'helius-preprocessed', slot: 7000, at: 1, seenAt: Date.now(), signature: t1.signature, wallet: f.copyWallet.toBase58(), tx: toRust(t1), keys: null,
+        outcome: { status: 'bought', signature: 'ourSig1', mint: m1.toBase58(), amountSol: 0.05, copySol: 0.4, via: 'Pump.fun' }, marks: { keys: 0.02, classified: 0.05, decide: 0.06 } });
+      // Declined (e.g. a coin it can't be sure of): handled here as usual.
+      const m2 = f.rnd();
+      const t2 = f.txBytes([f.pumpIx(DISC.buyExactSolIn, m2, 300_000_000, 1)]);
+      fp.emit('tx', { source: 'helius-preprocessed', slot: 7001, at: 2, seenAt: Date.now(), signature: t2.signature, wallet: f.copyWallet.toBase58(), tx: toRust(t2), keys: null,
+        outcome: { status: 'declined', reason: 'within BUY_COOLDOWN_SEC of another buy', mint: m2.toBase58() }, marks: { keys: 0.02, classified: 0.05 } });
+      await sleep(100);
+      const e1 = em.events.find((e) => e.ca === m1.toBase58());
+      const e2 = em.events.find((e) => e.ca === m2.toBase58());
+      check(e1 && e1.fastSent && e1.fastSent.signature === 'ourSig1' && e1.solAmount === -0.4 && e1.shred && em.seenSignatures.has(t1.signature), `bought: passed on with what the fast path did (${JSON.stringify(e1)})`);
+      check(e2 && !e2.fastSent && e2.solAmount === -0.3 && e2.slot === 7001, `declined: an ordinary early buy for this bot (${JSON.stringify(e2)})`);
+      check(em.events.length === 2, 'one event each');
+    } finally {
+      feeds.stop();
+      wss.close();
+      Object.assign(config, { SHRED_SOURCE: saved.s, SHRED_SOURCES: saved.ss, SHRED_STREAM_URL: saved.u });
+    }
   });
 
   await test('config: SHRED_SOURCE checked at startup', async () => {
