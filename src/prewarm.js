@@ -116,6 +116,12 @@ function blockhash() {
   return b && Date.now() - b.at < BLOCKHASH_MAX_AGE_MS ? b.value : null;
 }
 
+/** How long ago the current blockhash was fetched (ms), or null. */
+function blockhashAgeMs() {
+  const b = state.blockhash;
+  return b ? Date.now() - b.at : null;
+}
+
 /** Pump.fun's global config if warm, else null. */
 function pumpGlobal() {
   const g = state.pumpGlobal;
@@ -128,4 +134,4 @@ function _setForTests({ blockhash: bh, pumpGlobal: pg } = {}) {
   state.pumpGlobal = pg === undefined ? state.pumpGlobal : pg === null ? null : { value: pg, at: Date.now() };
 }
 
-module.exports = { start, stop, blockhash, pumpGlobal, _setForTests };
+module.exports = { start, stop, blockhash, blockhashAgeMs, pumpGlobal, _setForTests };

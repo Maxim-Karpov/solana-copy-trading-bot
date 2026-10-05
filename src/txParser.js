@@ -108,6 +108,13 @@ function analyzeWalletTx(parsedTx, walletAddress) {
   if (walletIndex === 0 && typeof fee === 'number') {
     lamportsChange += fee;
   }
+  // Tips and token-account deposits aren't part of the swap either: a
+  // 0.05 SOL buy that also opened the coin's account (~0.002 SOL) and tipped
+  // 0.001 SOL is a 0.05 SOL buy (buy sizing and MIN_TRADE_SOL go by it).
+  {
+    const costs = measureTradingCosts(parsedTx, walletAddress, walletIndex);
+    lamportsChange += costs.tipLamports + costs.rentLamports;
+  }
 
   // Net SPL token balance change(s) for this wallet's own token accounts.
   // Wrapped SOL is tracked separately and counted as SOL: most swaps wrap

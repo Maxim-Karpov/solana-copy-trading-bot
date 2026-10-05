@@ -36,14 +36,36 @@ fn chrono_like() -> String {
 }
 
 const MAX_ROUTER_SOL_CURVE: f64 = 200.0;
+
+thread_local! {
+    /// Inside a practice build (whose panic is caught and reported, not fatal).
+    static IN_PRACTICE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Any other panic stops the program (pm2 restarts it). Carrying on could
+/// leave it linked but deaf: a feed task gone, or the shared state's lock
+/// poisoned, while the Node bot still thinks everything's up.
+fn exit_on_panic() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        if !IN_PRACTICE.with(|f| f.get()) {
+            eprintln!("[fastpath] Stopping after an unexpected error (pm2 restarts it).");
+            std::process::exit(1);
+        }
+    }));
+}
 const TABLE_REFETCH_MS: f64 = 5000.0;
+/// A blockhash older than this may expire before the buy lands (they last ~60 s).
+const BLOCKHASH_MAX_AGE_SECS: u64 = 45;
 
 struct Shared {
     snapshot: Option<state::Snapshot>,
     local: state::Local,
-    template: Option<buy::Template>,
+    template: Option<Arc<buy::Template>>,
     verified: bool,
-    blockhash: Option<[u8; 32]>,
+    /// The latest blockhash from the Node bot, and when it arrived.
+    blockhash: Option<([u8; 32], Instant)>,
     routers: decode::Routers,
     tables: HashMap<Pubkey, Vec<Pubkey>>,
     table_fetched: HashMap<Pubkey, f64>,
@@ -136,6 +158,7 @@ struct App {
     unacked: Arc<Mutex<Unacked>>,
     sender: send::Sender,
     out: tokio::sync::mpsc::UnboundedSender<Value>,
+    linked: Arc<std::sync::atomic::AtomicBool>,
     started: Instant,
 }
 
@@ -162,7 +185,10 @@ impl App {
     }
 
     fn send_node(&self, v: Value) {
-        let _ = self.out.send(v);
+        // Not queued while the Node bot is away (its unsaved buys are resent on connect).
+        if self.linked.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = self.out.send(v);
+        }
     }
 
     async fn keys_for(&self, t: &tx::Tx) -> Option<Vec<Pubkey>> {
@@ -254,7 +280,10 @@ impl App {
             if !s.verified {
                 return decline("not yet checked against the Node bot's build");
             }
-            let Some(blockhash) = s.blockhash else { return decline("no recent blockhash yet") };
+            let Some((blockhash, bh_at)) = s.blockhash else { return decline("no recent blockhash yet") };
+            if bh_at.elapsed().as_secs() > BLOCKHASH_MAX_AGE_SECS {
+                return decline("the blockhash from the Node bot is too old");
+            }
             // Mayhem-mode coins (non-standard supply): only when his buy used a normal fee recipient.
             if template.reserved_fee_recipients.iter().any(|k| key_set.contains(k)) {
                 return decline("mayhem-mode coin (non-standard supply)");
@@ -274,10 +303,11 @@ impl App {
             let max_mcap = snap.msg.max_mcap_sol.unwrap_or(0.0);
             let limits = snap.msg.compute_limits.clone();
             let known_program = s.known_programs.get(&b.mint).copied();
+            let max_slots_behind = snap.msg.max_slots_behind;
             let reservation = if d.rehearse { None } else { Some(s.local.reserve(b.mint, d.amount_sol)) };
-            (template, blockhash, d, fees, max_mcap, limits, known_program, reservation)
+            (template, blockhash, d, fees, max_mcap, limits, known_program, reservation, max_slots_behind)
         };
-        let (template, blockhash, d, fees, max_mcap, limits, known_program, reservation) = prepared;
+        let (template, blockhash, d, fees, max_mcap, limits, known_program, reservation, max_slots_behind) = prepared;
         let t_decided = Instant::now();
         marks["decide"] = json!(mark(t_decided));
         if !d.rehearse {
@@ -362,7 +392,9 @@ impl App {
             return o;
         }
         // Too late for the slot guard already: don't pay a fee for a buy it would cancel.
-        if let Some(n) = self.shared.lock().unwrap().snapshot.as_ref().and_then(|s| s.msg.max_slots_behind) {
+        // (Read under the decision's lock above: locking again here while
+        // release() also locks would deadlock.)
+        if let Some(n) = max_slots_behind {
             let late = state::now_ms() - epoch_ms;
             if late > (n as f64 + 1.0) * state::SLOT_MS {
                 release(&self);
@@ -417,28 +449,44 @@ impl App {
     }
 
     fn on_node_message(&self, v: Value) {
-        let kind = v["type"].as_str().unwrap_or("");
+        let kind = v["type"].as_str().unwrap_or("").to_string();
+        // Parsed before taking the lock, so a buy deciding meanwhile isn't kept waiting.
+        match kind.as_str() {
+            "state" => {
+                match serde_json::from_value::<state::StateMsg>(v) {
+                    Ok(m) => {
+                        if !m.saved.is_empty() {
+                            self.unacked.lock().unwrap().remove(&m.saved);
+                        }
+                        let snap = state::Snapshot::new(m);
+                        self.shared.lock().unwrap().snapshot = Some(snap);
+                    }
+                    Err(e) => log(&format!("Unreadable state from the Node bot: {e}")),
+                }
+                return;
+            }
+            "template" => {
+                match serde_json::from_value::<buy::TemplateMsg>(v).map_err(anyhow::Error::from).and_then(|m| buy::Template::from_msg(&m)) {
+                    Ok(t) => {
+                        if t.user != self.cfg.wallet {
+                            log("The Node bot's template is for another wallet; ignoring it.");
+                        } else {
+                            self.shared.lock().unwrap().template = Some(Arc::new(t));
+                        }
+                    }
+                    Err(e) => log(&format!("Unreadable buy template: {e}")),
+                }
+                return;
+            }
+            "practice" => {
+                let reply = self.practice(&v);
+                self.send_node(reply);
+                return;
+            }
+            _ => {}
+        }
         let mut s = self.shared.lock().unwrap();
-        match kind {
-            "state" => match serde_json::from_value::<state::StateMsg>(v) {
-                Ok(m) => {
-                    if !m.saved.is_empty() {
-                        self.unacked.lock().unwrap().remove(&m.saved);
-                    }
-                    s.snapshot = Some(state::Snapshot::new(m));
-                }
-                Err(e) => log(&format!("Unreadable state from the Node bot: {e}")),
-            },
-            "template" => match serde_json::from_value::<buy::TemplateMsg>(v).map_err(anyhow::Error::from).and_then(|m| buy::Template::from_msg(&m)) {
-                Ok(t) => {
-                    if t.user != self.cfg.wallet {
-                        log("The Node bot's template is for another wallet; ignoring it.");
-                    } else {
-                        s.template = Some(t);
-                    }
-                }
-                Err(e) => log(&format!("Unreadable buy template: {e}")),
-            },
+        match kind.as_str() {
             "verified" => {
                 let ok = v["ok"].as_bool().unwrap_or(false);
                 if ok != s.verified {
@@ -453,7 +501,10 @@ impl App {
             }
             "blockhash" => {
                 if let Some(bh) = v["value"].as_str().and_then(Pubkey::from_b58) {
-                    s.blockhash = Some(bh.0);
+                    // Dated from when the Node bot fetched it.
+                    let age = std::time::Duration::from_millis(v["ageMs"].as_f64().unwrap_or(0.0).clamp(0.0, 600_000.0) as u64);
+                    let fetched = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+                    s.blockhash = Some((bh.0, fetched));
                 }
             }
             "routers" => match serde_json::from_value::<Vec<decode::Router>>(v["list"].clone()) {
@@ -477,11 +528,6 @@ impl App {
                     }
                 }
             }
-            "practice" => {
-                drop(s);
-                let reply = self.practice(&v);
-                self.send_node(reply);
-            }
             "disconnected" => {
                 // Without the Node bot nothing is bought from here.
                 s.snapshot = None;
@@ -491,10 +537,55 @@ impl App {
         }
     }
 
+    /// A feed event, handled in the feed's own task (the buy itself gets its own task).
+    fn on_feed(self: &Arc<Self>, ev: feeds::FeedEvent) {
+        let app = self;
+        match ev {
+            feeds::FeedEvent::State { source, state, detail } => {
+                app.feed_states.lock().unwrap().insert(source.to_string(), state.to_string());
+                log(&format!("{source}: {state}{}", if detail.is_empty() { String::new() } else { format!(" ({detail})") }));
+                app.send_node(json!({ "type": "feed", "source": source, "state": state, "detail": detail }));
+            }
+            feeds::FeedEvent::Unreadable { source, why } => app.send_node(json!({ "type": "unreadable", "source": source, "why": why })),
+            feeds::FeedEvent::Tx { source, slot, at, epoch_ms, tx } => {
+                // Only the copy wallets' own transactions (the filters also
+                // deliver ones that merely mention them).
+                let Some(wallet) = tx.signer_among(&app.cfg.copy_wallets) else { return };
+                let Some(sig) = tx.signature_b58() else { return };
+                let first = {
+                    let mut s = app.shared.lock().unwrap();
+                    if let Some((first_src, _)) = s.seen.get(&sig) {
+                        if *first_src == source {
+                            false
+                        } else {
+                            drop(s);
+                            app.send_node(json!({ "type": "seen", "source": source, "signature": sig, "at": app.ms_since_start(at), "slot": slot }));
+                            return;
+                        }
+                    } else {
+                        s.seen.insert(sig.clone(), (source, at));
+                        s.seen_order.push_back(sig.clone());
+                        if s.seen_order.len() > 5000 {
+                            if let Some(old) = s.seen_order.pop_front() {
+                                s.seen.remove(&old);
+                            }
+                        }
+                        true
+                    }
+                };
+                if !first {
+                    return; // a repeat from the same source
+                }
+                tokio::spawn(app.clone().handle(source, slot, at, epoch_ms, tx, wallet));
+            }
+        }
+    }
+
     /// Build a buy from explicit inputs, for the Node bot to compare with its own.
     fn practice(&self, v: &Value) -> Value {
         let id = v["id"].clone();
-        let r = (|| -> anyhow::Result<Value> {
+        IN_PRACTICE.with(|f| f.set(true));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<Value> {
             let i = &v["input"];
             let s = self.shared.lock().unwrap();
             let template = s.template.clone().ok_or_else(|| anyhow::anyhow!("no template"))?;
@@ -506,7 +597,7 @@ impl App {
             let known_program = i["knownTokenProgram"].as_str().and_then(Pubkey::from_b58);
             let lamports: u64 = i["lamports"].as_str().unwrap_or("0").parse()?;
             let max_mcap = i["maxMcapSol"].as_f64().unwrap_or(0.0);
-            let min_out = buy::min_tokens_at_mcap(&template, lamports, max_mcap) as u64;
+            let min_out = u64::try_from(buy::min_tokens_at_mcap(&template, lamports, max_mcap)).map_err(|_| anyhow::anyhow!("minimum out of range"))?;
             let f = &i["fees"];
             let acc = buy::coin_accounts(&mint, &present, &template.user, known_program).map_err(|e| anyhow::anyhow!(e))?;
             let guard = i["guardMaxSlot"].as_u64();
@@ -531,7 +622,9 @@ impl App {
             let wire = buy::wire(&signature, &built.message);
             let us = t0.elapsed().as_secs_f64() * 1e6;
             Ok(json!({ "ok": true, "wire": b64(&wire), "kind": kind, "limit": plan.limit, "learned": plan.learned, "minOut": min_out.to_string(), "buildUs": us }))
-        })();
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("the practice build panicked")));
+        IN_PRACTICE.with(|f| f.set(false));
         match r {
             Ok(mut o) => {
                 o["type"] = json!("practiceResult");
@@ -545,6 +638,7 @@ impl App {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+    exit_on_panic();
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -565,7 +659,11 @@ async fn main() {
     let (inbox_tx, mut inbox_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let feed_states: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let data_dir = cfg.env_file.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let bot_data = if data_dir.join("package.json").exists() { data_dir.join("data") } else { std::env::current_dir().unwrap_or_default().join("data") };
+    // The bot's own data/ folder: next to its .env, or above this program
+    // (<bot>/fastpath/target/release/fastpath), else the current folder's.
+    let from_exe = std::env::current_exe().ok().and_then(|e| e.ancestors().nth(4).map(|p| p.to_path_buf()));
+    let bot_dir = [Some(data_dir.clone()), from_exe].into_iter().flatten().find(|d| d.join("package.json").exists());
+    let bot_data = bot_dir.map(|d| d.join("data")).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("data"));
     let unacked_file = bot_data.join("fastpath-unacked.json");
     let loaded = Unacked::load(&unacked_file);
     let (dirty_tx, dirty_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -593,27 +691,6 @@ async fn main() {
 
     let sender = send::Sender::new(cfg.use_sender, &cfg.sender_url, &cfg.jito_url, &cfg.rpc_url);
     sender.spawn_keepalive();
-    let (feed_tx, mut feed_rx) = tokio::sync::mpsc::unbounded_channel::<feeds::FeedEvent>();
-    for src in &cfg.sources {
-        match src.as_str() {
-            "shreder" => match &cfg.shreder_url {
-                Some(u) => {
-                    log(&format!("Connecting to Shreder at {u}..."));
-                    feeds::spawn_shreder(u.clone(), cfg.copy_wallets.clone(), cfg.exclude_accounts.clone(), feed_tx.clone());
-                }
-                None => log("SHRED_SOURCE includes shreder but SHREDER_URL is not set; skipping it."),
-            },
-            "helius-preprocessed" => match &cfg.helius_ws_url {
-                Some(u) => {
-                    log(&format!("Connecting to Helius preprocessed transactions ({})...", config::redact(u)));
-                    feeds::spawn_helius(u.clone(), cfg.copy_wallets.clone(), cfg.exclude_accounts.clone(), cfg.max_msgs_per_min, feed_tx.clone());
-                }
-                None => log("SHRED_SOURCE includes helius-preprocessed but no Helius API key was found; skipping it."),
-            },
-            _ => {}
-        }
-    }
-
     // Buys from before a restart still count against the caps until saved.
     let mut local = state::Local::default();
     for (sig, r) in &loaded {
@@ -641,6 +718,7 @@ async fn main() {
         }),
         sender,
         out: link.out,
+        linked: link.connected,
         started: Instant::now(),
     });
 
@@ -651,45 +729,30 @@ async fn main() {
         }
     });
 
-    while let Some(ev) = feed_rx.recv().await {
-        match ev {
-            feeds::FeedEvent::State { source, state, detail } => {
-                app.feed_states.lock().unwrap().insert(source.to_string(), state.to_string());
-                log(&format!("{source}: {state}{}", if detail.is_empty() { String::new() } else { format!(" ({detail})") }));
-                app.send_node(json!({ "type": "feed", "source": source, "state": state, "detail": detail }));
-            }
-            feeds::FeedEvent::Unreadable { source, why } => app.send_node(json!({ "type": "unreadable", "source": source, "why": why })),
-            feeds::FeedEvent::Tx { source, slot, at, epoch_ms, tx } => {
-                // Only the copy wallets' own transactions (the filters also
-                // deliver ones that merely mention them).
-                let Some(wallet) = tx.signer_among(&app.cfg.copy_wallets) else { continue };
-                let Some(sig) = tx.signature_b58() else { continue };
-                let first = {
-                    let mut s = app.shared.lock().unwrap();
-                    if let Some((first_src, _)) = s.seen.get(&sig) {
-                        if *first_src == source {
-                            false
-                        } else {
-                            drop(s);
-                            app.send_node(json!({ "type": "seen", "source": source, "signature": sig, "at": app.ms_since_start(at), "slot": slot }));
-                            continue;
-                        }
-                    } else {
-                        s.seen.insert(sig.clone(), (source, at));
-                        s.seen_order.push_back(sig.clone());
-                        if s.seen_order.len() > 5000 {
-                            if let Some(old) = s.seen_order.pop_front() {
-                                s.seen.remove(&old);
-                            }
-                        }
-                        true
-                    }
-                };
-                if !first {
-                    continue; // a repeat from the same source
+    let sink: feeds::Sink = {
+        let a = app.clone();
+        Arc::new(move |ev| a.on_feed(ev))
+    };
+    for src in &app.cfg.sources {
+        match src.as_str() {
+            "shreder" => match &app.cfg.shreder_url {
+                Some(u) => {
+                    log(&format!("Connecting to Shreder at {u}..."));
+                    feeds::spawn_shreder(u.clone(), app.cfg.copy_wallets.clone(), app.cfg.exclude_accounts.clone(), sink.clone());
                 }
-                tokio::spawn(app.clone().handle(source, slot, at, epoch_ms, tx, wallet));
-            }
+                None => log("SHRED_SOURCE includes shreder but SHREDER_URL is not set; skipping it."),
+            },
+            "helius-preprocessed" => match &app.cfg.helius_ws_url {
+                Some(u) => {
+                    log(&format!("Connecting to Helius preprocessed transactions ({})...", config::redact(u)));
+                    feeds::spawn_helius(u.clone(), app.cfg.copy_wallets.clone(), app.cfg.exclude_accounts.clone(), app.cfg.max_msgs_per_min, sink.clone());
+                }
+                None => log("SHRED_SOURCE includes helius-preprocessed but no Helius API key was found; skipping it."),
+            },
+            _ => {}
         }
     }
+
+    // Everything runs in the feeds' and the link's tasks from here on.
+    std::future::pending::<()>().await;
 }

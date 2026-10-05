@@ -115,6 +115,110 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(m && m.tokenDeltaRaw === 10000000000n && m.lamportsDelta === -101005000 && m.decimals === 6, `own fill measured (got ${JSON.stringify(m, (k, v) => typeof v === 'bigint' ? v.toString() : v)})`);
   });
 
+  await test('txParser: a buy\'s tip and token-account deposit are not counted as what it bought', async () => {
+    const { parseCopyTradeTransaction } = require(src('txParser.js'));
+    const { JITO_TIP_ACCOUNTS } = require(src('jitoTip.js'));
+    const w = Keypair.generate().publicKey.toBase58();
+    const mint = Keypair.generate().publicKey.toBase58();
+    const ata = Keypair.generate().publicKey;
+    const tip = String(JITO_TIP_ACCOUNTS[0]);
+    const rent = 2039280;
+    const tx = {
+      slot: 5,
+      meta: {
+        err: null,
+        fee: 5000,
+        preBalances: [10e9, 0],
+        postBalances: [10e9 - 1e9 - 5000 - 1e6 - rent, rent],
+        preTokenBalances: [],
+        postTokenBalances: [{ accountIndex: 1, ...tb(w, mint, 1000e6) }],
+        innerInstructions: []
+      },
+      transaction: {
+        signatures: ['sigT'],
+        message: {
+          accountKeys: [{ pubkey: new PublicKey(w) }, { pubkey: ata }],
+          instructions: [
+            { programId: new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P') },
+            { program: 'system', parsed: { type: 'transfer', info: { source: w, destination: tip, lamports: 1e6 } } }
+          ]
+        }
+      }
+    };
+    const buy = parseCopyTradeTransaction(tx, w);
+    check(buy && buy.trade === 'buy' && Math.abs(buy.solAmount + 1) < 1e-9, `1 SOL buy, not 1.003 (got ${buy && buy.solAmount})`);
+  });
+
+  await test('rpcPool: a failing request moves this call on, not everyone; trouble rotates once', async () => {
+    const rpcPool = require(src('rpcPool.js'));
+    if (!rpcPool.hasFallbacks()) return;
+    const before = rpcPool.getHttpUrl();
+    const seen = [];
+    const r = await rpcPool.withFailover(async (conn) => {
+      seen.push(conn.rpcEndpoint);
+      if (seen.length === 1) throw new Error('failed to get info about account: Invalid param');
+      return 'ok';
+    });
+    check(r === 'ok' && seen[0] !== seen[1], `retried elsewhere (${JSON.stringify(seen)})`);
+    check(rpcPool.getHttpUrl() === before, 'a request error does not move every later call to another endpoint');
+    // Two calls failing together on the same endpoint: it rotates once, not twice.
+    const order = [];
+    for (let i = 0; i < 3; i++) {
+      order.push(rpcPool.getHttpUrl());
+      rpcPool.rotate();
+    }
+    const start = order[0];
+    let n = 0;
+    await Promise.all([0, 1].map(() => rpcPool.withFailover(async (conn) => {
+      n += 1;
+      if (conn.rpcEndpoint === start) throw new Error('fetch failed');
+      return 'ok';
+    })));
+    check(rpcPool.getHttpUrl() === order[1], `moved one endpoint on, not two (now ${rpcPool.getHttpUrl()}, order ${JSON.stringify(order)})`);
+    for (let i = 0; i < 3 && rpcPool.getHttpUrl() !== before; i++) rpcPool.rotate(); // as later tests expect
+    check(n >= 3, `both calls retried (${n} attempts)`);
+  });
+
+  await test('fastPath: a state change reaches the fast path at once, changes together go as one', async () => {
+    const net = require('net');
+    const { FastPath } = require(src('fastPath.js'));
+    const got = [];
+    const server = net.createServer((sock) => {
+      let buf = '';
+      sock.on('data', (d) => {
+        buf += d;
+        let i;
+        while ((i = buf.indexOf('\n')) !== -1) {
+          const m = JSON.parse(buf.slice(0, i));
+          buf = buf.slice(i + 1);
+          if (m.type === 'state') got.push({ at: Date.now(), m });
+        }
+      });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    let paused = false;
+    const fp = new FastPath({ port: server.address().port, stateProvider: () => ({ buying: !paused }) });
+    fp._connect(); // the link only: no 250 ms timer, so every state seen here is an event push
+    for (let i = 0; i < 50 && !fp.connected; i++) await sleep(10);
+    check(fp.connected, 'linked');
+    paused = true;
+    const t0 = Date.now();
+    fp.pushSoon();
+    fp.pushSoon();
+    fp.pushSoon();
+    await sleep(100);
+    check(got.length === 1, `three changes in one go sent once (got ${got.length})`);
+    check(got[0] && got[0].m.buying === false && got[0].at - t0 < 50, `the new state, at once (${got[0] && got[0].at - t0} ms)`);
+    paused = false;
+    fp.pushSoon();
+    await sleep(50);
+    check(got.length === 2 && got[1].m.buying === true, 'a later change is sent too');
+    fp.stop(); // sends a last state as it closes
+    await sleep(100);
+    check(got.length === 3, `a last state on stop (got ${got.length})`);
+    server.close();
+  });
+
   await test('dexMapper: PREFERRED_DEX=auto still detects the real venue', async () => {
     const { mapDex, detectVenue } = require(src('dexMapper.js'));
     check(mapDex(['Pump.fun']) === 'auto', 'portal gets preferred dex');
@@ -440,7 +544,7 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
       }
       if (opts && opts.body) {
         const b = JSON.parse(opts.body);
-        if (b.method === 'sendTransaction') { sentTx = VersionedTransaction.deserialize(B58.decode(b.params[0])); return respond({ result: 'jitoSig' }); }
+        if (b.method === 'sendTransaction') { sentTx = VersionedTransaction.deserialize(b.params[1] && b.params[1].encoding === 'base64' ? Buffer.from(b.params[0], 'base64') : B58.decode(b.params[0])); return respond({ result: 'jitoSig' }); }
       }
       return respond({ result: 'x' });
     };
@@ -1026,6 +1130,13 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     const f0 = Date.now();
     await Promise.all(Array.from({ length: 100 }, () => free.acquire()));
     check(Date.now() - f0 < 50, 'RPC_MAX_RPS=0 means no limit');
+    // Under one a second: spaced by more than a second.
+    const slow = createLimiter(4 / 3);
+    const s0 = Date.now();
+    await slow.acquire();
+    await slow.acquire();
+    const gap = Date.now() - s0;
+    check(gap >= 700 && gap < 1000, `RPC_MAX_RPS=1.33: 750 ms apart (got ${gap})`);
   });
 
   await test('usageStats: counts calls and websocket data, estimates credits', async () => {
@@ -1427,7 +1538,7 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
           const coinFilter = { maxMcapSol: 300, minMcapSol: null, blockedCreators: null };
           const sig = await te.buyToken({ mint: mint.toBase58(), amountSol: 0.25, slippage: 20, tip: config.JITO_TIP, dex: 'pumpfun', venue: 'pumpfun', pool: 'pump-curve', fastHint: hintFor(mint, TOKEN_2022_PROGRAM_ID), coinFilter });
           const req = sent.filter((x) => x.body.method === 'sendTransaction').pop();
-          const bytes = ${JSON.stringify(via)} === 'sender' ? Buffer.from(req.body.params[0], 'base64') : Buffer.from(bs58.decode(req.body.params[0]));
+          const bytes = Buffer.from(req.body.params[0], 'base64'); // Sender and Jito both get base64
           const tx = VersionedTransaction.deserialize(bytes);
           const spki = Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), user.toBuffer()]);
           out.verifies = crypto.verify(null, Buffer.from(tx.message.serialize()), crypto.createPublicKey({ key: spki, format: 'der', type: 'spki' }), Buffer.from(tx.signatures[0]));

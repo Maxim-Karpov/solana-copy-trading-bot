@@ -4,11 +4,15 @@
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub struct Link {
     /// Messages to the Node bot (dropped while it isn't connected).
     pub out: UnboundedSender<Value>,
+    /// Is the Node bot connected? (Nothing is queued for it while it isn't.)
+    pub connected: Arc<AtomicBool>,
 }
 
 /// What a new connection gets first: the hello (with the feeds' current
@@ -22,15 +26,26 @@ pub async fn serve(port: u16, inbox: UnboundedSender<Value>, greeting: Greeting)
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let (out_tx, out_rx) = unbounded_channel::<Value>();
     let out_rx = std::sync::Arc::new(tokio::sync::Mutex::new(out_rx));
+    let connected = Arc::new(AtomicBool::new(false));
+    let conn = connected.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((sock, _)) = listener.accept().await else { continue };
+            let sock = match listener.accept().await {
+                Ok((sock, _)) => sock,
+                Err(e) => {
+                    // e.g. out of file descriptors: don't spin.
+                    crate::log(&format!("Couldn't accept a connection: {e}"));
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
             let _ = sock.set_nodelay(true);
             crate::log("The Node bot connected.");
             let (rd, mut wr) = sock.into_split();
             let inbox = inbox.clone();
             let out_rx = out_rx.clone();
             let greeting = greeting.clone();
+            conn.store(true, Ordering::Release);
             // Only one connection is served at a time: a new one replaces the old.
             let writer = tokio::spawn(async move {
                 let mut rx: tokio::sync::MutexGuard<'_, UnboundedReceiver<Value>> = out_rx.lock().await;
@@ -58,9 +73,10 @@ pub async fn serve(port: u16, inbox: UnboundedSender<Value>, greeting: Greeting)
                 }
             }
             writer.abort();
+            conn.store(false, Ordering::Release);
             let _ = inbox.send(serde_json::json!({ "type": "disconnected" }));
             crate::log("The Node bot disconnected.");
         }
     });
-    Ok(Link { out: out_tx })
+    Ok(Link { out: out_tx, connected })
 }

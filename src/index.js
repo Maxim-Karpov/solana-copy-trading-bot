@@ -225,6 +225,10 @@ process.on('uncaughtException', (err) => {
     // FAST_PATH="rust": the link with the Rust fast path (set up below).
     let fastPath = null;
     const buyingMints = new Map(); // mint -> buys of it in flight (from here or the fast path)
+    // Something the fast path decides from has changed: it hears at once.
+    const stateChanged = () => {
+      if (fastPath) fastPath.pushSoon();
+    };
     // The fast path's buys from the moment it decides (its "claim"), until
     // this bot takes them over: counted against the caps at once.
     const fastClaims = new Map(); // his signature -> { mint, sol, opensNew, at }
@@ -370,6 +374,7 @@ process.on('uncaughtException', (err) => {
     function persist(pos, updates) {
       Object.assign(pos, updates);
       storage.updatePosition(pos.id, updates);
+      if ('status' in updates || 'cost_basis_sol' in updates || 'buy_amount' in updates) stateChanged();
     }
 
     // --- Wallet SOL balance (checked in the background) ---
@@ -383,7 +388,10 @@ process.on('uncaughtException', (err) => {
     async function refreshBalance() {
       try {
         const lamports = await rpcPool.withFailover((c) => c.getBalance(walletPubkey, 'confirmed'), 5000, { priority: 'low' });
-        walletSol = lamports / 1e9;
+        if (walletSol !== lamports / 1e9) {
+          walletSol = lamports / 1e9;
+          stateChanged();
+        }
       } catch {
         // keep the last known value
       }
@@ -636,14 +644,17 @@ process.on('uncaughtException', (err) => {
      * needs_reconcile set, and its amount filled in from the on-chain
      * balance here. Caller must hold the mint's exclusive lock.
      */
+    const RECONCILE_GIVE_UP_MS = process.env.RECONCILE_GIVE_UP_MS !== undefined ? Number(process.env.RECONCILE_GIVE_UP_MS) : 120_000;
     async function reconcileInner(pos) {
       if (!pos.needs_reconcile || !activeMap.has(pos.id)) return;
       const bal = await getOnChainBalance(pos.mint);
       if (bal.decimals === null || bal.raw === 0n) {
         // Not visible yet. After ~20 tries (a couple of minutes of polling),
         // conclude the buy delivered nothing rather than track it forever.
+        // (Time as well as tries: polling every 250 ms makes 20 tries only 5 s.)
         pos.reconcileAttempts = (pos.reconcileAttempts || 0) + 1;
-        if (pos.reconcileAttempts >= 20) {
+        if (!pos.reconcileSince) pos.reconcileSince = Date.now();
+        if (pos.reconcileAttempts >= 20 && Date.now() - pos.reconcileSince >= RECONCILE_GIVE_UP_MS) {
           markClosed(pos, { close_reason: 'buy delivered no tokens (none found on-chain)', token_amount: '0' });
           const msg = `Position ${shortId(pos.id)} (${pos.mint}): no tokens ever appeared on-chain after its buy; marked closed.`;
           warn(`[Main] ${msg}`);
@@ -936,6 +947,11 @@ process.on('uncaughtException', (err) => {
       if (closingSet.has(live.id)) {
         return { ok: false, message: 'A sell for this position is already in progress.' };
       }
+      // Keep tapped while this copy-wallet exit waited in the coin's queue.
+      if (isCopyExit(reason) && live.keep) {
+        info(`[Main] Position ${shortId(live.id)} is on KEEP; not following the copy wallet's exit.`);
+        return { ok: false, message: 'Stopped: you tapped Keep.' };
+      }
       closingSet.add(live.id);
       try {
         return await tracked(() => closeInner(live, reason, { persistIntent, alreadySent }));
@@ -961,6 +977,11 @@ process.on('uncaughtException', (err) => {
       const live = activeMap.get(pos.id);
       if (!live || live.status !== 'active') return { ok: false, message: 'That position is already closed.' };
       if (closingSet.has(live.id)) return { ok: false, message: 'A sell for this position is already in progress.' };
+      // Keep tapped while this copy-wallet sell waited in the coin's queue.
+      if (isCopyExit(reason) && live.keep) {
+        info(`[Main] Position ${shortId(live.id)} is on KEEP; not following the copy wallet's sell.`);
+        return { ok: false, message: 'Stopped: you tapped Keep.' };
+      }
 
       closingSet.add(live.id);
       try {
@@ -1247,11 +1268,20 @@ process.on('uncaughtException', (err) => {
         .finally(() => queuedSells.delete(pos.id));
     }
 
+    const PRICE_SAVE_EVERY_MS = 5000;
+    let lastPriceSaveAt = 0;
+
     function requestPartialRetry(pos) {
       if (isBusy(pos.id)) return;
       queuedSells.add(pos.id);
-      const pct = num(pos.pending_sell_pct);
-      tracked(() => runExclusive(pos.mint, () => partialSell(pos, pct, 'STIERED copy-sell (retry)', { isRetry: true })))
+      // The % is read when it runs (Keep may have cleared it, or another failure added to it, meanwhile).
+      tracked(() =>
+        runExclusive(pos.mint, () => {
+          const pct = num(pos.pending_sell_pct);
+          if (!(pct > 0)) return { ok: true, message: 'Nothing to retry.' };
+          return partialSell(pos, pct, 'STIERED copy-sell (retry)', { isRetry: true });
+        })
+      )
         .catch((err) => error(`[Main] Partial-sell retry for ${shortId(pos.id)} failed unexpectedly:`, err.message))
         .finally(() => queuedSells.delete(pos.id));
     }
@@ -1431,7 +1461,12 @@ process.on('uncaughtException', (err) => {
             })
           );
 
-          if (batchedUpdates.length > 0) {
+          // Only the latest price changed: written at most every few seconds
+          // (the whole positions file is rewritten each time, blocking the
+          // bot meanwhile; the live values are in memory anyway).
+          const priceOnly = batchedUpdates.every((u) => Object.keys(u.updates).every((k) => k === 'current_price'));
+          if (batchedUpdates.length > 0 && (!priceOnly || Date.now() - lastPriceSaveAt >= PRICE_SAVE_EVERY_MS)) {
+            lastPriceSaveAt = Date.now();
             try {
               storage.updatePositionsBatch(batchedUpdates);
             } catch (err) {
@@ -2061,6 +2096,7 @@ process.on('uncaughtException', (err) => {
           });
           activeMap.set(newPos.id, { ...newPos });
           releasePlace(); // now counted as an open position
+          stateChanged();
           pos = activeMap.get(newPos.id);
           if (pos.sell_after_at) scheduleTimedExit(pos);
           const opened = pos;
@@ -2145,6 +2181,7 @@ process.on('uncaughtException', (err) => {
         const n = (buyingMints.get(mint) || 1) - 1;
         if (n > 0) buyingMints.set(mint, n);
         else buyingMints.delete(mint);
+        stateChanged();
       }
     }
 
@@ -2161,6 +2198,7 @@ process.on('uncaughtException', (err) => {
       const exited = config.SKIP_REBUYS === 'any' ? pct > 0 : config.SKIP_REBUYS === 'full' ? pct >= 99.9 : false;
       if (bookkeeping && exited && !hasExited(wallet, mint)) {
         exitedMints.add(`${wallet}:${mint}`);
+        stateChanged();
         try {
           storage.addExitedMint(`${wallet}:${mint}`);
         } catch (err) {
@@ -2304,6 +2342,7 @@ process.on('uncaughtException', (err) => {
           // the check stricter (his next buy of it isn't treated as a first).
           for (const m of found) h.atStart.add(m);
           h.loaded = true;
+          stateChanged();
           info(
             `[Main] Copy wallet${who(wallet)} holds ${h.atStart.size} coin(s) right now` +
               (config.ONLY_COPY_FIRST_BUY ? "; its later buys of those won't be copied (ONLY_COPY_FIRST_BUY)." : '.')
@@ -2571,10 +2610,10 @@ process.on('uncaughtException', (err) => {
      * tell). Wallets that fire several copies of each buy (only one lands, the
      * rest fail) would otherwise make a failed duplicate look like a failed buy.
      */
-    async function copyWalletHoldsNow(mint, wallet = config.COPY_WALLET) {
+    async function copyWalletHoldsNow(mint, wallet = config.COPY_WALLET, commitment = 'processed') {
       try {
         const resp = await rpcPool.withFailover((conn) =>
-          conn.getParsedTokenAccountsByOwner(new PublicKey(wallet), { mint: new PublicKey(mint) }, 'processed')
+          conn.getParsedTokenAccountsByOwner(new PublicKey(wallet), { mint: new PublicKey(mint) }, commitment)
         );
         return resp.value.some((a) => BigInt(a.account.data.parsed.info.tokenAmount.amount) > 0n);
       } catch (err) {
@@ -2593,6 +2632,9 @@ process.on('uncaughtException', (err) => {
     // His buy may still be landing before that (tests shorten both).
     const HOLD_CHECK_MIN_AGE_MS = process.env.HOLD_CHECK_MIN_AGE_MS !== undefined ? Number(process.env.HOLD_CHECK_MIN_AGE_MS) : 60_000;
     const movedOut = new Set(); // wallet:mint he moved out (MIRROR_TRANSFERS off: not an exit)
+    // One empty reading isn't enough to sell on (a lagging RPC node can briefly
+    // show none): read again, a moment later and at "confirmed".
+    const HOLD_RECHECK_MS = process.env.HOLD_RECHECK_MS !== undefined ? Number(process.env.HOLD_RECHECK_MS) : 2000;
     let holdCheckRunning = false;
     async function checkCopyHoldings(why) {
       if (holdCheckRunning || shuttingDown) return;
@@ -2607,7 +2649,9 @@ process.on('uncaughtException', (err) => {
           const wallet = walletOf(pos);
           if (movedOut.has(`${wallet}:${pos.mint}`)) continue;
           if ((await copyWalletHoldsNow(pos.mint, wallet)) !== false) continue;
-          if (!activeMap.has(pos.id) || isBusy(pos.id) || pos.keep) continue;
+          await sleep(HOLD_RECHECK_MS);
+          if ((await copyWalletHoldsNow(pos.mint, wallet, 'confirmed')) !== false) continue;
+          if (!activeMap.has(pos.id) || isBusy(pos.id) || pos.keep || pos.pending_exit) continue;
           const msg = `Copy wallet${who(wallet)} no longer holds ${pos.mint}, but its sell never reached the bot (${why}); exiting position ${shortId(pos.id)} as if it sold everything.`;
           warn(`[Main] ${msg}`);
           telegramBot.notifyAlert(msg);
@@ -2642,6 +2686,7 @@ process.on('uncaughtException', (err) => {
         if (failedCopyBuys.size > 500) failedCopyBuys.delete(failedCopyBuys.values().next().value);
         // It didn't hold the coin after all.
         holdingsOf(wallet).seen.delete(mint);
+        stateChanged();
         for (const pos of activeByMint(mint)) {
           if (pos.parent_signature === signature) exitFailedCopyBuy(pos);
         }
@@ -2676,6 +2721,7 @@ process.on('uncaughtException', (err) => {
         h.seen.delete(msg.ca);
         h.atStart.delete(msg.ca);
       }
+      if (!msg.shredEarlyExit && (msg.trade === 'buy' || num(msg.sellPercent) >= 99.9)) stateChanged();
       tracked(() => runExclusive(msg.ca, () => handleCopyTrade(msg))).catch((err) => {
         error('[Main] Error handling copyTrade:', err.message);
         // The same failure (e.g. SolanaPortal down) for every trade in a row
@@ -2725,6 +2771,7 @@ process.on('uncaughtException', (err) => {
         }
         paused = Boolean(value);
         storage.setPaused(paused);
+        stateChanged();
         info(`[Main] Buying ${paused ? 'PAUSED' : 'RESUMED'} from Telegram.`);
       },
       // Sell every open position at once (different tokens in parallel).

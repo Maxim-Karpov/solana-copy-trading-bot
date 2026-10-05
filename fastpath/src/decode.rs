@@ -2,7 +2,7 @@
 //! Port of the buy side of src/shredDecode.js: direct Pump.fun curve buys,
 //! and router buys whose format the Node bot has learned (pushed to us).
 
-use crate::keys::{find_pda, known, match_pda, Pubkey};
+use crate::keys::{known, match_pda, Pubkey};
 use crate::tx::Tx;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 pub const DISC_BUY: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
 pub const DISC_BUY_EXACT_SOL_IN: [u8; 8] = [0x38, 0xfc, 0x74, 0x08, 0x9e, 0xdf, 0xcd, 0x5f];
 pub const DISC_SELL: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
-const FAST_BUMPS: u8 = 8;
+const FAST_BUMPS: u8 = 16;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,21 +90,17 @@ pub fn find_curve_coin(keys: &[Pubkey], wallet: &Pubkey) -> Option<Pubkey> {
     if !set.contains(&known::pump()) {
         return None;
     }
-    let mut cands: Vec<Pubkey> = keys
+    let mut seen = HashSet::new();
+    let cands: Vec<Pubkey> = keys
         .iter()
         .copied()
-        .filter(|k| k != wallet && !not_router(k) && *k != known::wsol())
+        .filter(|k| k != wallet && !not_router(k) && *k != known::wsol() && seen.insert(*k))
         .collect();
-    cands.dedup();
-    // Most Pump.fun mints end in "pump": try those first.
-    cands.sort_by_key(|k| if k.b58().ends_with("pump") { 0 } else { 1 });
     let seeds: Vec<Vec<&[u8]>> = cands.iter().map(|m| vec![b"bonding-curve".as_slice(), m.bytes().as_slice()]).collect();
     let present = |p: &Pubkey| set.contains(p);
-    if let Some((_, i)) = match_pda(&seeds, &known::pump(), &present, FAST_BUMPS) {
-        return Some(cands[i]);
-    }
-    // A curve with an unusually low bump: the full derivation.
-    cands.into_iter().find(|m| set.contains(&find_pda(&[b"bonding-curve", m.bytes()], &known::pump())))
+    // Bumps 255..240 cover all but 1 in 65,536 curves; no slow full derivation
+    // (it would run for every router transaction that isn't a curve buy).
+    match_pda(&seeds, &known::pump(), &present, FAST_BUMPS).map(|(_, i)| cands[i])
 }
 
 /// The first buy in `tx` by `wallet` that has an amount.

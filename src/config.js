@@ -94,7 +94,7 @@ const config = {
   TRADE_TYPE:         requiredEnv('TRADE_TYPE').toUpperCase(),     // "EXACT", "SAFE", "TIERED", or "STIERED"
   BUY_AMOUNT:         numEnv('BUY_AMOUNT', { required: true, min: 0, minExclusive: true }),   // SOL, used if SAFE
   TAKE_PROFIT:        numEnv('TAKE_PROFIT', { required: true, min: 0, minExclusive: true }),  // percent
-  STOP_LOSS:          numEnv('STOP_LOSS', { required: true, min: 0, minExclusive: true }),    // percent
+  STOP_LOSS:          numEnv('STOP_LOSS', { required: true, min: 0, minExclusive: true, max: 100 }), // percent
   SLIPPAGE:           numEnv('SLIPPAGE', { required: true, min: 0, minExclusive: true, max: 100 }), // percent
   JITO_TIP:           numEnv('JITO_TIP', { required: true, min: 0 }),                         // SOL
   JITO_ENGINE:        requiredEnv('JITO_ENGINE'),

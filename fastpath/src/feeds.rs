@@ -6,9 +6,18 @@ use crate::keys::Pubkey;
 use crate::tx::{self, Ix, Lookup, Tx, Version};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::tungstenite::Message;
+
+/// Where a feed's events go: called straight from the feed's own task (no
+/// channel hop between a transaction arriving and its handling starting).
+pub type Sink = Arc<dyn Fn(FeedEvent) + Send + Sync>;
+
+/// Helius: reconnect if nothing at all (not even a pong) arrives for this long.
+const HELIUS_SILENT_SECS: u64 = 25;
+const HELIUS_PING_SECS: u64 = 10;
+const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 pub mod shredstream {
     tonic::include_proto!("shredstream");
@@ -26,22 +35,22 @@ fn backoff(attempt: u32) -> Duration {
 
 // ---------------- Helius preprocessedSubscribe ----------------
 
-pub fn spawn_helius(url: String, wallets: Vec<Pubkey>, exclude: Vec<String>, max_per_min: u64, out: UnboundedSender<FeedEvent>) {
+pub fn spawn_helius(url: String, wallets: Vec<Pubkey>, exclude: Vec<String>, max_per_min: u64, out: Sink) {
     tokio::spawn(async move {
         let mut attempt = 0u32;
         loop {
-            match helius_once(&url, &wallets, &exclude, max_per_min, &out).await {
+            match helius_once(&url, &wallets, &exclude, max_per_min, &out, &mut attempt).await {
                 Ok(Stop::Stopped(why)) => {
-                    let _ = out.send(FeedEvent::State { source: "helius-preprocessed", state: "stopped", detail: why });
+                    out(FeedEvent::State { source: "helius-preprocessed", state: "stopped", detail: why });
                     return;
                 }
-                Ok(Stop::Closed) => attempt = 0,
+                Ok(Stop::Closed) => {}
                 Err(e) => {
                     eprintln!("[fastpath] Helius preprocessed: {e}");
                     attempt += 1;
                 }
             }
-            let _ = out.send(FeedEvent::State { source: "helius-preprocessed", state: "down", detail: String::new() });
+            out(FeedEvent::State { source: "helius-preprocessed", state: "down", detail: String::new() });
             tokio::time::sleep(backoff(attempt)).await;
         }
     });
@@ -52,8 +61,10 @@ enum Stop {
     Stopped(String),
 }
 
-async fn helius_once(url: &str, wallets: &[Pubkey], exclude: &[String], max_per_min: u64, out: &UnboundedSender<FeedEvent>) -> Result<Stop> {
-    let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+async fn helius_once(url: &str, wallets: &[Pubkey], exclude: &[String], max_per_min: u64, out: &Sink, attempt: &mut u32) -> Result<Stop> {
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), tokio_tungstenite::connect_async(url))
+        .await
+        .map_err(|_| anyhow::anyhow!("connecting timed out"))??;
     let (mut tx_ws, mut rx_ws) = ws.split();
     let sub = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "preprocessedSubscribe",
@@ -62,13 +73,20 @@ async fn helius_once(url: &str, wallets: &[Pubkey], exclude: &[String], max_per_
     tx_ws.send(Message::Text(sub.to_string())).await?;
     let mut window_start = Instant::now();
     let mut window_count = 0u64;
-    let mut ping = tokio::time::interval(Duration::from_secs(30));
+    let mut ping = tokio::time::interval(Duration::from_secs(HELIUS_PING_SECS));
     ping.tick().await;
+    let mut last_heard = Instant::now();
     loop {
         tokio::select! {
-            _ = ping.tick() => { tx_ws.send(Message::Ping(vec![])).await?; }
+            _ = ping.tick() => {
+                if last_heard.elapsed() > Duration::from_secs(HELIUS_SILENT_SECS) {
+                    anyhow::bail!("nothing heard for {HELIUS_SILENT_SECS} s (not even a pong); reconnecting");
+                }
+                tx_ws.send(Message::Ping(vec![])).await?;
+            }
             msg = rx_ws.next() => {
                 let Some(msg) = msg else { return Ok(Stop::Closed) };
+                last_heard = Instant::now();
                 match msg? {
                     Message::Binary(b) => {
                         let at = Instant::now();
@@ -81,11 +99,11 @@ async fn helius_once(url: &str, wallets: &[Pubkey], exclude: &[String], max_per_
                             }
                         }
                         const HEADER: usize = 1 + 8 + 64;
-                        if b.len() <= HEADER { let _ = out.send(FeedEvent::Unreadable { source: "helius-preprocessed", why: "short frame".into() }); continue; }
+                        if b.len() <= HEADER { out(FeedEvent::Unreadable { source: "helius-preprocessed", why: "short frame".into() }); continue; }
                         let slot = u64::from_le_bytes(b[1..9].try_into().unwrap());
                         match tx::parse(&b[HEADER..]) {
-                            Ok(t) => { let _ = out.send(FeedEvent::Tx { source: "helius-preprocessed", slot, at, epoch_ms, tx: t }); }
-                            Err(e) => { let _ = out.send(FeedEvent::Unreadable { source: "helius-preprocessed", why: e.to_string() }); }
+                            Ok(t) => out(FeedEvent::Tx { source: "helius-preprocessed", slot, at, epoch_ms, tx: t }),
+                            Err(e) => out(FeedEvent::Unreadable { source: "helius-preprocessed", why: e.to_string() }),
                         }
                     }
                     Message::Text(t) => {
@@ -94,7 +112,8 @@ async fn helius_once(url: &str, wallets: &[Pubkey], exclude: &[String], max_per_
                             return Ok(Stop::Stopped(format!("Helius refused preprocessedSubscribe: {}", v["error"])));
                         }
                         if v["id"] == 1 && v.get("result").is_some() {
-                            let _ = out.send(FeedEvent::State { source: "helius-preprocessed", state: "up", detail: String::new() });
+                            *attempt = 0; // working again: the next drop retries quickly
+                            out(FeedEvent::State { source: "helius-preprocessed", state: "up", detail: String::new() });
                         }
                     }
                     Message::Close(_) => return Ok(Stop::Closed),
@@ -107,24 +126,24 @@ async fn helius_once(url: &str, wallets: &[Pubkey], exclude: &[String], max_per_
 
 // ---------------- Shreder decoded shreds ----------------
 
-pub fn spawn_shreder(url: String, wallets: Vec<Pubkey>, exclude: Vec<String>, out: UnboundedSender<FeedEvent>) {
+pub fn spawn_shreder(url: String, wallets: Vec<Pubkey>, exclude: Vec<String>, out: Sink) {
     tokio::spawn(async move {
         let mut attempt = 0u32;
         loop {
-            match shreder_once(&url, &wallets, &exclude, &out).await {
-                Ok(()) => attempt = 0,
+            match shreder_once(&url, &wallets, &exclude, &out, &mut attempt).await {
+                Ok(()) => {}
                 Err(e) => {
                     eprintln!("[fastpath] Shreder: {e}");
                     attempt += 1;
                 }
             }
-            let _ = out.send(FeedEvent::State { source: "shreder", state: "down", detail: String::new() });
+            out(FeedEvent::State { source: "shreder", state: "down", detail: String::new() });
             tokio::time::sleep(backoff(attempt)).await;
         }
     });
 }
 
-async fn shreder_once(url: &str, wallets: &[Pubkey], exclude: &[String], out: &UnboundedSender<FeedEvent>) -> Result<()> {
+async fn shreder_once(url: &str, wallets: &[Pubkey], exclude: &[String], out: &Sink, attempt: &mut u32) -> Result<()> {
     use shredstream::shreder_service_client::ShrederServiceClient;
     use shredstream::{SubscribeRequestFilterTransactions, SubscribeTransactionsRequest};
     let endpoint = tonic::transport::Endpoint::from_shared(url.to_string())?
@@ -132,7 +151,7 @@ async fn shreder_once(url: &str, wallets: &[Pubkey], exclude: &[String], out: &U
         .http2_keep_alive_interval(Duration::from_secs(15))
         .keep_alive_timeout(Duration::from_secs(5))
         .keep_alive_while_idle(true)
-        .connect_timeout(Duration::from_secs(10));
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
     let endpoint = if url.starts_with("https") { endpoint.tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())? } else { endpoint };
     let channel = endpoint.connect().await?;
     let mut client = ShrederServiceClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
@@ -144,19 +163,16 @@ async fn shreder_once(url: &str, wallets: &[Pubkey], exclude: &[String], out: &U
     let req = SubscribeTransactionsRequest { transactions: filters };
     let requests = futures_util::stream::iter(vec![req]).chain(futures_util::stream::pending());
     let mut stream = client.subscribe_transactions(requests).await?.into_inner();
-    let _ = out.send(FeedEvent::State { source: "shreder", state: "up", detail: String::new() });
+    *attempt = 0;
+    out(FeedEvent::State { source: "shreder", state: "up", detail: String::new() });
     while let Some(msg) = stream.message().await? {
         let at = Instant::now();
         let epoch_ms = crate::state::now_ms();
         let Some(upd) = msg.transaction else { continue };
         let slot = upd.slot;
         match upd.transaction.as_ref().and_then(from_shreder) {
-            Some(t) => {
-                let _ = out.send(FeedEvent::Tx { source: "shreder", slot, at, epoch_ms, tx: t });
-            }
-            None => {
-                let _ = out.send(FeedEvent::Unreadable { source: "shreder", why: "transaction without a readable message".into() });
-            }
+            Some(t) => out(FeedEvent::Tx { source: "shreder", slot, at, epoch_ms, tx: t }),
+            None => out(FeedEvent::Unreadable { source: "shreder", why: "transaction without a readable message".into() }),
         }
     }
     Ok(())

@@ -17,7 +17,7 @@
 
 function createLimiter(maxPerSecond) {
   const unlimited = !(maxPerSecond > 0);
-  const gapMs = 1000 / Math.max(1, maxPerSecond || 1);
+  const gapMs = unlimited ? 0 : 1000 / maxPerSecond; // RPC_MAX_RPS=0.5: one call every 2 s
   let nextAt = 0; // earliest time the next call may start
   const queues = { high: [], low: [] };
   let timer = null;

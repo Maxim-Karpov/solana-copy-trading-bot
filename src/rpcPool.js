@@ -73,8 +73,8 @@ function countRequests(conn) {
  * a quote already includes trades only just made (the copy wallet's own
  * buy, in processed detection mode) instead of a state ~1s old.
  */
-function getConnection(commitment = 'confirmed') {
-  const ep = current();
+function getConnection(commitment = 'confirmed', index = currentIndex) {
+  const ep = endpoints[index];
   if (!ep.connections) ep.connections = {};
   if (!ep.connections[commitment]) {
     // disableRetryOnRateLimit: when the provider says "too many requests",
@@ -119,13 +119,28 @@ function rotate() {
  * once per endpoint before giving up and throwing the last error. With no
  * fallbacks configured this is equivalent to `asyncFn(getConnection())`.
  */
+/**
+ * Is this the endpoint's fault (unreachable, timing out, overloaded,
+ * refusing) rather than the request's (an account that doesn't exist, a
+ * transaction the chain rejects)? Only those move everyone to the next one.
+ */
+function endpointTrouble(err) {
+  const m = String((err && err.message) || err || '');
+  return (
+    (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) ||
+    /timed out|timeout|fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EPIPE|socket hang up|network|\b(429|5\d\d)\b|Too Many Requests|Bad Gateway|Service Unavailable/i.test(m)
+  );
+}
+
 async function withFailover(asyncFn, timeoutMs = RPC_CALL_TIMEOUT_MS, { priority = 'high' } = {}) {
   let lastErr;
   const attempts = endpoints.length;
+  const start = currentIndex;
   for (let i = 0; i < attempts; i++) {
+    const index = (start + i) % attempts;
     await limiter.acquire(priority);
     try {
-      return await withTimeout(Promise.resolve().then(() => asyncFn(getConnection())), timeoutMs, 'RPC call');
+      return await withTimeout(Promise.resolve().then(() => asyncFn(getConnection('confirmed', index))), timeoutMs, 'RPC call');
     } catch (err) {
       lastErr = err;
       const refused = /\b429\b|Too Many Requests/i.test(err && err.message);
@@ -138,8 +153,10 @@ async function withFailover(asyncFn, timeoutMs = RPC_CALL_TIMEOUT_MS, { priority
         );
       }
       if (i < attempts - 1) {
-        warn(`[RpcPool] Call failed on ${redactUrl(current().httpUrl)} (${err.message}); trying next endpoint...`);
-        rotate();
+        warn(`[RpcPool] Call failed on ${redactUrl(endpoints[index].httpUrl)} (${err.message}); trying next endpoint...`);
+        // Everyone moves on only if the endpoint itself is in trouble, and only
+        // once: calls failing together don't each rotate (and skip one).
+        if (endpointTrouble(err) && currentIndex === index) rotate();
       }
     }
   }

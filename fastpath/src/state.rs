@@ -104,6 +104,66 @@ pub struct Snapshot {
     positions: HashSet<Pubkey>,
     blocked_vaults: HashSet<Pubkey>,
     pub quote_mints: HashSet<Pubkey>,
+    quote_prefixes: Prefixes,
+}
+
+/// Base58 prefixes as byte ranges: a key's base58 text starts with "Xs" exactly
+/// when its 32 bytes fall in a range worked out once, so checking a
+/// transaction's keys needs no base58 encoding.
+#[derive(Default)]
+pub struct Prefixes {
+    ranges: Vec<([u8; 32], [u8; 32])>,
+    /// Prefixes starting with '1' (leading zero bytes): checked as text.
+    slow: Vec<String>,
+}
+
+fn pad32(v: &[u8]) -> Option<[u8; 32]> {
+    if v.len() > 32 {
+        return None;
+    }
+    let mut a = [0u8; 32];
+    a[32 - v.len()..].copy_from_slice(v);
+    Some(a)
+}
+
+impl Prefixes {
+    pub fn new(list: &[String]) -> Prefixes {
+        let mut p = Prefixes::default();
+        for pre in list {
+            if pre.is_empty() || pre.starts_with('1') || pre.len() > 44 || bs58::decode(pre).into_vec().is_err() {
+                p.slow.push(pre.clone());
+                continue;
+            }
+            // A 32-byte key without a leading zero byte is 43 or 44 characters.
+            for n in [43usize, 44] {
+                if pre.len() > n {
+                    continue;
+                }
+                let fill = n - pre.len();
+                let lo = bs58::decode(format!("{pre}{}", "1".repeat(fill))).into_vec().ok().and_then(|v| pad32(&v));
+                let Some(lo) = lo else { continue }; // past 32 bytes already
+                let hi = bs58::decode(format!("{pre}{}", "z".repeat(fill))).into_vec().ok().and_then(|v| pad32(&v)).unwrap_or([0xff; 32]);
+                p.ranges.push((lo, hi));
+            }
+        }
+        p
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty() && self.slow.is_empty()
+    }
+
+    pub fn matches(&self, k: &Pubkey) -> bool {
+        let b = k.bytes();
+        if b[0] != 0 {
+            return self.ranges.iter().any(|(lo, hi)| b >= lo && b <= hi);
+        }
+        // A leading zero byte: the text starts with '1', which only the slow list can match (rare).
+        !self.slow.is_empty() && {
+            let t = k.b58();
+            self.slow.iter().any(|p| t.starts_with(p.as_str()))
+        }
+    }
 }
 
 fn set(v: &[String]) -> HashSet<Pubkey> {
@@ -124,6 +184,7 @@ impl Snapshot {
             positions: set(&msg.positions),
             blocked_vaults: set(&msg.blocked_vaults),
             quote_mints: set(&msg.quote_mints),
+            quote_prefixes: Prefixes::new(&msg.quote_prefixes),
             held,
             exited,
             received_at: now_ms(),
@@ -282,10 +343,7 @@ pub fn decide(snap: Option<&Snapshot>, local: &Local, wallet: &Pubkey, mint: &Pu
     if keys.iter().any(|k| s.quote_mints.contains(k)) {
         return Err("his transaction involves a quote token (may not be SOL-paired)".into());
     }
-    if !m.quote_prefixes.is_empty() && keys.iter().any(|k| {
-        let t = k.b58();
-        m.quote_prefixes.iter().any(|p| t.starts_with(p.as_str()))
-    }) {
+    if !s.quote_prefixes.is_empty() && keys.iter().any(|k| s.quote_prefixes.matches(k)) {
         return Err("his transaction involves a stock token (may not be SOL-paired)".into());
     }
     let mut guard_max_slot = None;
@@ -303,4 +361,47 @@ pub fn decide(snap: Option<&Snapshot>, local: &Local, wallet: &Pubkey, mint: &Pu
     let pct_fee = if m.fees.buy_fee_pct > 0.0 { amount * (m.fees.buy_fee_pct / 100.0) } else { 0.0 };
     let fee_sol = m.fees.buy_fee_sol.max(pct_fee);
     Ok(Decision { amount_sol: amount, fee_sol, guard_max_slot, rehearse: !m.buying && m.rehearse })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_ranges_match_the_text() {
+        let list: Vec<String> = ["Xs", "Ab9", "z", "2", "11", "Xs3eBt"].iter().map(|x| x.to_string()).collect();
+        let p = Prefixes::new(&list);
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut hits = 0;
+        for i in 0..200_000 {
+            let mut b = [0u8; 32];
+            for c in b.chunks_mut(8) {
+                c.copy_from_slice(&next().to_le_bytes());
+            }
+            if i % 50 == 0 {
+                b[0] = 0;
+            }
+            // Some keys built to start with a listed prefix.
+            if i % 7 == 0 {
+                let pre = &list[i % list.len()];
+                if let Ok(v) = bs58::decode(format!("{pre}{}", bs58::encode(&b[..]).into_string().get(pre.len()..).unwrap_or(""))).into_vec() {
+                    if v.len() == 32 {
+                        b.copy_from_slice(&v);
+                    }
+                }
+            }
+            let k = Pubkey(b);
+            let t = k.b58();
+            let want = list.iter().any(|x| t.starts_with(x.as_str()));
+            assert_eq!(p.matches(&k), want, "{t}");
+            hits += want as u32;
+        }
+        assert!(hits > 1000);
+    }
 }

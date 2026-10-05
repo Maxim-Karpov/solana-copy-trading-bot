@@ -40,6 +40,7 @@ const PUMP_TOKEN_DECIMALS = 6;
 const PING_INTERVAL_MS = 30000;
 const LOGS_ID_BASE = 100; // request ids of the per-wallet logsSubscribe calls
 const RECONNECT_DELAY_MS = 5000;
+const FIRST_RECONNECT_DELAY_MS = 500;
 const GET_TX_MAX_ATTEMPTS = PROCESSED ? 12 : 5;
 const GET_TX_RETRY_DELAY_MS = 400;
 const SEEN_SIGNATURES_MAX = 2000;
@@ -177,7 +178,8 @@ class CopyEmitter extends EventEmitter {
       setTimeout(() => this.connect(), RECONNECT_DELAY_MS);
       return;
     }
-    const ws = new WebSocket(wsUrl);
+    // A connect that hangs (no answer to the handshake) fails after 10 s instead of never.
+    const ws = new WebSocket(wsUrl, { handshakeTimeout: 10_000 });
     this.ws = ws;
 
     ws.on('pong', () => {
@@ -370,7 +372,10 @@ class CopyEmitter extends EventEmitter {
         return;
       }
       this.consecutiveFailures += 1;
-      warn(`[WebSocket] Closed: ${code} - ${reason}. Reconnecting in ${RECONNECT_DELAY_MS}ms...`);
+      // A connection that was working and dropped: straight back (copy trades
+      // are missed while it's down). Repeated failures: wait between tries.
+      const delay = this.consecutiveFailures === 1 ? FIRST_RECONNECT_DELAY_MS : RECONNECT_DELAY_MS;
+      warn(`[WebSocket] Closed: ${code} - ${reason}. Reconnecting in ${delay}ms...`);
 
       if (
         rpcPool.hasFallbacks() &&
@@ -380,7 +385,7 @@ class CopyEmitter extends EventEmitter {
         rpcPool.rotate();
       }
 
-      setTimeout(() => this.connect(), RECONNECT_DELAY_MS);
+      setTimeout(() => this.connect(), delay);
     });
   }
 

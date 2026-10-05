@@ -131,13 +131,13 @@ pub fn parse(b: &[u8]) -> Result<Tx> {
     let num_signers = r.u8()?;
     r.take(2)?;
     let nkeys = r.compact()?;
-    let mut static_keys = Vec::with_capacity(nkeys);
+    let mut static_keys = Vec::with_capacity(nkeys.min(256));
     for _ in 0..nkeys {
         static_keys.push(r.key()?);
     }
     r.take(32)?; // blockhash
     let nix = r.compact()?;
-    let mut instructions = Vec::with_capacity(nix);
+    let mut instructions = Vec::with_capacity(nix.min(64));
     for _ in 0..nix {
         let program_id_index = r.u8()?;
         let na = r.compact()?;
@@ -177,7 +177,7 @@ fn parse_v1(b: &[u8]) -> Result<Tx> {
     r.take(32)?; // blockhash
     let nix = r.u8()? as usize;
     let naddr = r.u8()? as usize;
-    let mut static_keys = Vec::with_capacity(naddr);
+    let mut static_keys = Vec::with_capacity(naddr.min(256));
     for _ in 0..naddr {
         static_keys.push(r.key()?);
     }
@@ -186,12 +186,12 @@ fn parse_v1(b: &[u8]) -> Result<Tx> {
         + (if mask & CFG_LOADED_ACCOUNTS_DATA_SIZE != 0 { 4 } else { 0 })
         + (if mask & CFG_HEAP_SIZE != 0 { 4 } else { 0 });
     r.take(cfg_len)?;
-    let mut headers = Vec::with_capacity(nix);
+    let mut headers = Vec::with_capacity(nix.min(64));
     for _ in 0..nix {
         let h = r.take(4)?;
         headers.push((h[0], h[1] as usize, u16::from_le_bytes([h[2], h[3]]) as usize));
     }
-    let mut instructions = Vec::with_capacity(nix);
+    let mut instructions = Vec::with_capacity(nix.min(64));
     for (program_id_index, na, nd) in headers {
         let accounts = r.take(na)?.to_vec();
         let data = r.take(nd)?.to_vec();

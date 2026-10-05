@@ -6,8 +6,8 @@
 
 ![Node.js](https://img.shields.io/badge/node-%E2%89%A518.17-339933?logo=node.js&logoColor=white)
 ![Solana](https://img.shields.io/badge/Solana-mainnet-9945FF?logo=solana&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-168%20passing-2ea44f)
-![Version](https://img.shields.io/badge/version-3.29.0-blue)
+![Tests](https://img.shields.io/badge/tests-171%20passing-2ea44f)
+![Version](https://img.shields.io/badge/version-3.30.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Speed](#-built-for-speed) · [Rust fast path](#-rust-fast-path) · [Telegram](#-telegram-control) · [Full reference](docs/REFERENCE.md)
@@ -70,7 +70,7 @@ nano .env               # RPC, wallet, copy wallets, mode, limits
 
 # 3. Check and run
 npm run check-env       # missing or misspelt settings (never prints values)
-npm test                # 168 tests, fully simulated, no network or funds
+npm test                # 171 tests, fully simulated, no network or funds
 npm start
 ```
 
@@ -132,7 +132,7 @@ On top of any mode:
 
 ## 🦀 Rust fast path
 
-The race part of the bot, in Rust (`fastpath/`). It reads the shred feeds itself, spots the copy wallet's Pump.fun buy, decides from the state the Node bot keeps sending it, then builds, signs and sends the buy. Build and sign take **~0.04 ms**, against ~0.3 ms for the hand-built Node buy and ~2 ms for the SDK. There are no garbage-collection pauses. Everything else stays in Node: positions, sells, instant sells, Telegram, and any buy the fast path isn't sure about.
+The race part of the bot, in Rust (`fastpath/`). It reads the shred feeds itself, spots the copy wallet's Pump.fun buy, decides from the state the Node bot keeps it supplied with (sent the moment anything changes, so the decision never waits on it), then builds, signs and sends the buy. Build and sign take **~0.04 ms**, against ~0.3 ms for the hand-built Node buy and ~2 ms for the SDK. There are no garbage-collection pauses. Everything else stays in Node: positions, sells, instant sells, Telegram, and any buy the fast path isn't sure about.
 
 **Safe by design**
 - **Checked before it buys.** It buys only after building a practice buy that is byte-identical to the Node bot's. The check runs at startup and again every 30 s.

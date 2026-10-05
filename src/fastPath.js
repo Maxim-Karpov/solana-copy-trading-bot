@@ -3,8 +3,8 @@
 // FAST_PATH="rust": the link with the Rust fast path (fastpath/), a separate
 // program on the same server that reads the shred feeds and builds, signs
 // and sends shred-copied Pump.fun buys itself. This bot stays in charge:
-//   - it keeps the fast path supplied, several times a second, with
-//     everything a buy decision needs (paused or not, room under the caps,
+//   - it keeps the fast path supplied with everything a buy decision needs,
+//     the moment anything changes (and every 250 ms regardless) (paused or not, room under the caps,
 //     cooldown, coins to skip, buy sizes, fees, blockhash, learned routers
 //     and compute limits), and the buy template from Pump.fun's SDK;
 //   - before the fast path may buy, the same practice buy is built here and
@@ -66,11 +66,33 @@ class FastPath extends EventEmitter {
   }
 
   stop() {
+    // A last state first (shutting down: no buying), flushed before closing.
+    this.pushState();
     this.stopped = true;
     clearInterval(this.stateTimer);
     clearInterval(this.checkTimer);
     clearTimeout(this.reconnectTimer);
-    if (this.sock) this.sock.destroy();
+    if (this.sock) {
+      const sock = this.sock;
+      sock.end();
+      const t = setTimeout(() => sock.destroy(), 500);
+      if (t.unref) t.unref();
+    }
+  }
+
+  /**
+   * Something the fast path decides from has changed (paused, a position
+   * opened or closed, the balance, a coin the copy wallet bought or exited):
+   * send the state right away instead of at the next 250 ms tick. Changes made
+   * together (in the same turn of the event loop) go out as one.
+   */
+  pushSoon() {
+    if (this.pushQueued || !this.connected) return;
+    this.pushQueued = true;
+    setImmediate(() => {
+      this.pushQueued = false;
+      this.pushState();
+    });
   }
 
   _connect() {
@@ -189,7 +211,8 @@ class FastPath extends EventEmitter {
     const bh = prewarm.blockhash();
     if (bh && bh !== this.lastBlockhash) {
       this.lastBlockhash = bh;
-      this.send({ type: 'blockhash', value: bh });
+      // Its age too: a blockhash lasts ~60 s from when it was fetched, not from when the fast path hears of it.
+      this.send({ type: 'blockhash', value: bh, ageMs: prewarm.blockhashAgeMs ? prewarm.blockhashAgeMs() : 0 });
     }
     let s = null;
     try {

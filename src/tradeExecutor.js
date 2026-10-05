@@ -52,7 +52,7 @@ const portalDown = { until: 0, at: 0, reason: '' };
 // A coin a direct builder can't handle (no standard Raydium pool, migrated
 // curve, ...) isn't retried with that builder for this long.
 const DIRECT_UNSUPPORTED_SKIP_MS = 10 * 60 * 1000;
-const directUnsupported = new Map(); // `${label}:${mint}` -> { until, reason }
+const directUnsupported = new Map(); // `${label}:${side}:${mint}` -> { until, reason }
 const JITO_TIMEOUT_MS = 10000;
 const DIRECT_BUILD_TIMEOUT_MS = 8000;
 // Compute-unit limits the direct builders set (used to turn PRIORITY_FEE_SOL
@@ -152,7 +152,8 @@ async function signAndSendTx(tx, opts = {}) {
       throw err;
     }
   }
-  return sendSignedTxViaJito(bs58.encode(tx.serialize()), txSignature);
+  // base64: Jito accepts it, and it's ~1 ms quicker to encode than base58.
+  return sendSignedTxViaJito(Buffer.from(tx.serialize()).toString('base64'), txSignature, 'base64');
 }
 
 /**
@@ -170,13 +171,13 @@ async function sendViaRpcFallback(raw, txSignature) {
   }
 }
 
-/** Submit an already-signed, bs58-encoded transaction via Jito. */
-async function sendSignedTxViaJito(signedTxBs58, txSignature) {
+/** Submit an already-signed transaction via Jito (base58 text unless `encoding` is 'base64'). */
+async function sendSignedTxViaJito(signedTx, txSignature, encoding = 'base58') {
   const jitoPayload = {
     jsonrpc: '2.0',
     id: 1,
     method: 'sendTransaction',
-    params: [signedTxBs58]
+    params: encoding === 'base64' ? [signedTx, { encoding: 'base64' }] : [signedTx]
   };
 
   let res;
@@ -194,7 +195,11 @@ async function sendSignedTxViaJito(signedTxBs58, txSignature) {
     throw new AmbiguousSendError(`Jito sendTransaction outcome unknown (${err.message})`, txSignature);
   }
 
-  // Jito answered: an error status or error body is a definite rejection.
+  // A gateway error may come after Jito already forwarded it: follow it.
+  if (res.status >= 500) {
+    throw new AmbiguousSendError(`Jito answered ${res.status} ${res.statusText}; outcome unknown`, txSignature);
+  }
+  // Otherwise an error status or error body is a definite rejection.
   if (!res.ok) {
     throw new Error(`Jito sendTransaction failed: ${res.status} ${res.statusText} | ${res.text.slice(0, 300)}`);
   }
@@ -332,7 +337,8 @@ async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, t
     return null;
   }
 
-  const cacheKey = `${label}:${mint}`;
+  // Per side: a reason a buy can't be built (e.g. fast-path hints) mustn't send this coin's sells elsewhere.
+  const cacheKey = `${label}:${side}:${mint}`;
   const known = directUnsupported.get(cacheKey);
   if (known && Date.now() < known.until) {
     info(`[tradeExecutor] Direct ${label} not possible for ${mint} (${known.reason}, checked earlier); ${nextRouteText(side)}.`);

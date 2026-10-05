@@ -79,15 +79,22 @@ impl Template {
         if accounts[ROLE_USER].key != user {
             bail!("template is for another wallet");
         }
+        let (v_s0, v_t0, supply): (u128, u128, u128) = (m.min_out.v_s0.parse()?, m.min_out.v_t0.parse()?, m.min_out.supply.parse()?);
+        if v_s0 == 0 || v_t0 == 0 || supply == 0 {
+            bail!("template has a zero curve constant");
+        }
+        if m.fee_recipients.is_empty() {
+            bail!("template has no fee recipients");
+        }
         Ok(Template {
             user,
             accounts,
             track_volume: m.track_volume,
             fee_recipients: m.fee_recipients.iter().map(|s| pk(s)).collect::<Result<_>>()?,
             reserved_fee_recipients: m.reserved_fee_recipients.iter().map(|s| pk(s)).collect::<Result<_>>()?,
-            v_s0: m.min_out.v_s0.parse()?,
-            v_t0: m.min_out.v_t0.parse()?,
-            supply: m.min_out.supply.parse()?,
+            v_s0,
+            v_t0,
+            supply,
             worst_fee_bps: m.min_out.worst_fee_bps as u128,
             sender_tips: m.sender_tips.iter().map(|s| pk(s)).collect::<Result<_>>()?,
             jito_tips: m.jito_tips.iter().map(|s| pk(s)).collect::<Result<_>>()?,
@@ -106,10 +113,10 @@ fn isqrt(n: u128) -> u128 {
         }
         x = (x + n / x) >> 1;
     }
-    while x * x > n {
+    while x.checked_mul(x).map_or(true, |v| v > n) {
         x -= 1;
     }
-    while (x + 1) * (x + 1) <= n {
+    while (x + 1).checked_mul(x + 1).is_some_and(|v| v <= n) {
         x += 1;
     }
     x
@@ -118,18 +125,25 @@ fn isqrt(n: u128) -> u128 {
 /// Tokens `lamports` buys if the curve stood at `max_mcap_sol` (min_tokens_out).
 /// Same arithmetic as minTokensAtMcap in pumpfunDirect.js.
 pub fn min_tokens_at_mcap(t: &Template, lamports: u64, max_mcap_sol: f64) -> u128 {
-    let k = t.v_s0 * t.v_t0;
-    let mcap = (max_mcap_sol * 1e9).floor() as u128;
-    let vs = isqrt(mcap * k / t.supply);
-    if vs == 0 {
-        return 0;
-    }
-    let vt = k / vs;
-    let net = (lamports as u128) * 10000 / (10000 + t.worst_fee_bps);
-    if net <= 1 {
-        return 0;
-    }
-    (net - 1) * vt / (vs + net - 1)
+    // 0 (= don't buy) if anything is out of range rather than overflowing.
+    let calc = || -> Option<u128> {
+        if t.supply == 0 {
+            return None;
+        }
+        let k = t.v_s0.checked_mul(t.v_t0)?;
+        let mcap = (max_mcap_sol * 1e9).floor() as u128;
+        let vs = isqrt(mcap.checked_mul(k)? / t.supply);
+        if vs == 0 {
+            return None;
+        }
+        let vt = k / vs;
+        let net = (lamports as u128).checked_mul(10000)? / (10000 + t.worst_fee_bps);
+        if net <= 1 {
+            return None;
+        }
+        (net - 1).checked_mul(vt)?.checked_div(vs.checked_add(net - 1)?)
+    };
+    calc().unwrap_or(0)
 }
 
 pub struct CoinAccounts {

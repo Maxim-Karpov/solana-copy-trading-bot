@@ -286,6 +286,28 @@ function tokenProgramFromKeys(mintPk, keySet) {
   return classic ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID;
 }
 
+// BLOCKED_CREATORS as creator-vault addresses (what a buy instruction
+// shows), worked out once per list rather than on every buy (each is a PDA
+// search, ~0.1-1 ms).
+const blockedVaultCache = new WeakMap();
+function blockedVaultsOf(blockedCreators) {
+  if (!blockedCreators || !blockedCreators.size) return new Set();
+  let set = blockedVaultCache.get(blockedCreators);
+  if (!set || set.sourceSize !== blockedCreators.size) {
+    set = new Set();
+    for (const c of blockedCreators) {
+      try {
+        set.add(creatorVaultPda(new PublicKey(c)).toBase58());
+      } catch {
+        // not an address: can't match anything
+      }
+    }
+    set.sourceSize = blockedCreators.size;
+    blockedVaultCache.set(blockedCreators, set);
+  }
+  return set;
+}
+
 // Pump.fun's fee recipients, as text and bytes, once per global config.
 const recipientCache = new WeakMap();
 function recipientsOf(global) {
@@ -296,7 +318,7 @@ function recipientsOf(global) {
     r = {
       reserved: list(global.reservedFeeRecipient, global.reservedFeeRecipients).map((k) => k.toBase58()),
       normal: normal.map((k) => k.toBase58()),
-      normalBytes: [global.feeRecipient, ...(global.feeRecipients || [])].map((k) => k.toBuffer())
+      normalBytes: normal.map((k) => k.toBuffer())
     };
     recipientCache.set(global, r);
   }
@@ -367,12 +389,7 @@ async function buildFastBuy({ connection, user, mintPk, solAmount, fastHint, max
   const fastIx = new TransactionInstruction({ programId: buyIx.programId, keys, data });
 
   const tx = await assembleV0Tx({ connection, payer: user, instructions: [ataIx, fastIx], computeUnitLimit, priorityFeeMicroLamports, tipSol, guardInstructions });
-  let creatorBlocked = false;
-  if (blockedCreators && blockedCreators.size) {
-    for (const c of blockedCreators) {
-      if (creatorVaultPda(new PublicKey(c)).toBase58() === fastHint.creatorVault) creatorBlocked = true;
-    }
-  }
+  const creatorBlocked = blockedVaultsOf(blockedCreators).has(fastHint.creatorVault);
   attachCoin(tx, { capOnChain: true, creatorBlocked });
   tx.builtFrom = `no lookup (SHRED_FAST_BUY: exact ${solAmount} SOL, at least ${(Number(minOut) / 1e6).toFixed(0)} tokens = market cap ${maxMcapSol} SOL)`;
   return { tx };
@@ -407,12 +424,7 @@ function handBuiltFastBuy({ global, user, mintPk, solAmount, fastHint, keySet, m
   });
   if (!built.tx) return { final: /token program/.test(built.reason), reason: built.reason };
   const { tx } = built;
-  let creatorBlocked = false;
-  if (blockedCreators && blockedCreators.size) {
-    for (const c of blockedCreators) {
-      if (creatorVaultPda(new PublicKey(c)).toBase58() === fastHint.creatorVault) creatorBlocked = true;
-    }
-  }
+  const creatorBlocked = blockedVaultsOf(blockedCreators).has(fastHint.creatorVault);
   attachCoin(tx, { capOnChain: true, creatorBlocked });
   tx.builtFrom = `no lookup, hand-built (SHRED_FAST_BUY: exact ${solAmount} SOL, at least ${(Number(minOut) / 1e6).toFixed(0)} tokens = market cap ${maxMcapSol} SOL)`;
   return { tx };
