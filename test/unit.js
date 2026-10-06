@@ -3122,6 +3122,7 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
       check(!(await L.safeToFetch(bad, pub)), `refused ${bad}`);
     }
     check(!(await L.safeToFetch('https://evil.example/x', async () => [{ address: '10.0.0.5' }])), 'host resolving to a private address refused');
+    check(/private/.test(await L.unsafeReason('https://evil.example/x', async () => [{ address: '10.0.0.5' }])) && /https/.test(await L.unsafeReason('http://a.com/')) && (await L.unsafeReason('https://ipfs.io/x', pub)) === null, 'a refusal says why; an allowed page has no reason');
     check(!(await L.safeToFetch('https://evil.example/x', async () => [{ address: '93.184.216.34' }, { address: '127.0.0.1' }])), 'any private answer refused');
     check(L.cleanLink('javascript:alert(1)') === null && L.cleanLink('https://t.me/abc') === 'https://t.me/abc' && L.cleanLink('https://x.com/a\nb c') === 'https://x.com/ab' + 'c', 'only http(s) links kept, whitespace stripped');
     const mint = Keypair.generate().publicKey.toBase58();

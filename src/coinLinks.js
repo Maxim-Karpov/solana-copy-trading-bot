@@ -16,7 +16,6 @@ const dns = require('dns').promises;
 const net = require('net');
 const { PublicKey } = require('@solana/web3.js');
 const { metadataPda } = require('@pump-fun/pump-swap-sdk');
-const rpcPool = require('./rpcPool');
 
 const FETCH_TIMEOUT_MS = 1500;
 const MAX_BYTES = 20_000;
@@ -50,19 +49,30 @@ function privateAddress(ip) {
   return v === '::1' || v === '::' || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb');
 }
 
-/** Is it safe to fetch this URL from the server? */
-async function safeToFetch(urlStr, lookup = dns.lookup) {
+/** Why this URL must not be fetched from the server (a sentence), or null if it may be. */
+async function unsafeReason(urlStr, lookup = dns.lookup) {
   let u;
-  try { u = new URL(urlStr); } catch { return false; }
-  if (u.protocol !== 'https:' || u.username || u.password || (u.port && u.port !== '443')) return false;
+  try { u = new URL(urlStr); } catch { return 'not a valid web address'; }
+  if (u.protocol !== 'https:') return `only https is fetched (this is ${u.protocol.replace(':', '')})`;
+  if (u.username || u.password) return 'the address contains a user name or password';
+  if (u.port && u.port !== '443') return `unusual port ${u.port}`;
   const host = u.hostname;
-  if (!host.includes('.') || net.isIP(host) || host.startsWith('[') || /\.(local|internal|localhost|lan)$/i.test(host)) return false;
+  if (net.isIP(host) || host.startsWith('[')) return 'the address is a raw IP address, not a name';
+  if (!host.includes('.') || /\.(local|internal|localhost|lan)$/i.test(host)) return `"${host}" looks like an internal name`;
   try {
     const addrs = await lookup(host, { all: true });
-    return addrs.length > 0 && addrs.every((a) => !privateAddress(a.address));
-  } catch {
-    return false;
+    if (!addrs.length) return `"${host}" didn't resolve`;
+    const bad = addrs.find((a) => privateAddress(a.address));
+    if (bad) return `"${host}" resolves to a private/internal address (${bad.address})`;
+  } catch (err) {
+    return `"${host}" couldn't be looked up (${err.code || err.message})`;
   }
+  return null;
+}
+
+/** Is it safe to fetch this URL from the server? */
+async function safeToFetch(urlStr, lookup = dns.lookup) {
+  return (await unsafeReason(urlStr, lookup)) === null;
 }
 
 /** Keep only plain http(s) links, trimmed and of sane length. */
@@ -75,7 +85,7 @@ function cleanLink(v) {
 /** { website, twitter, telegram } (each a string or null), or null if nothing could be read. */
 async function readLinks(mint, { fetchImpl = globalThis.fetch, lookup, getInfo } = {}) {
   const mintPk = new PublicKey(mint);
-  const info = await (getInfo ? getInfo(metadataPda(mintPk)) : rpcPool.withFailover((c) => c.getAccountInfo(metadataPda(mintPk)), undefined, { priority: 'low' }));
+  const info = await (getInfo ? getInfo(metadataPda(mintPk)) : require('./rpcPool').withFailover((c) => c.getAccountInfo(metadataPda(mintPk)), undefined, { priority: 'low' }));
   if (!info) return null;
   const uri = parseUri(Buffer.from(info.data));
   if (!uri || !(await safeToFetch(uri, lookup))) return null;
@@ -108,15 +118,17 @@ const SITE_MAX_BYTES = 400_000;
  * page): that counts as 'link'. A page built by scripts can show the address
  * without it being in the HTML we fetch, so false is "not found", not "absent".
  */
-async function siteMentions(website, mint, { fetchImpl = globalThis.fetch, lookup } = {}) {
+async function siteMentions(website, mint, { fetchImpl = globalThis.fetch, lookup, trace = () => {} } = {}) {
   if (website.includes(mint)) return 'link';
   let url = website;
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), SITE_TIMEOUT_MS);
   try {
     for (let hop = 0; hop < 3; hop++) {
-      if (!(await safeToFetch(url, lookup))) return null; // checked again on every redirect
-      const res = await fetchImpl(url, { signal: ctl.signal, redirect: 'manual', headers: { accept: 'text/html,*/*;q=0.5' } });
+      const why = await unsafeReason(url, lookup); // checked again on every redirect
+      if (why) { trace({ step: 'refused', url, why }); return null; }
+      const res = await fetchImpl(url, { signal: ctl.signal, redirect: 'manual', headers: { accept: 'text/html,*/*;q=0.5', 'user-agent': 'Mozilla/5.0 (compatible; coin-check)' } });
+      trace({ step: 'fetched', url, status: res.status });
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers && res.headers.get && res.headers.get('location');
         if (!loc) return null;
@@ -125,6 +137,7 @@ async function siteMentions(website, mint, { fetchImpl = globalThis.fetch, looku
       }
       if (!res.ok) return null;
       const text = (await res.text()).slice(0, SITE_MAX_BYTES);
+      trace({ step: 'read', bytes: text.length });
       return text.includes(mint) ? 'page' : false;
     }
     return null;
@@ -135,4 +148,4 @@ async function siteMentions(website, mint, { fetchImpl = globalThis.fetch, looku
   }
 }
 
-module.exports = { siteMentions, readLinks, parseUri, safeToFetch, cleanLink, privateAddress };
+module.exports = { siteMentions, readLinks, parseUri, safeToFetch, unsafeReason, cleanLink, privateAddress };
