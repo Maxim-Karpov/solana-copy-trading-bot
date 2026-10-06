@@ -3898,6 +3898,91 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     cb._resetForTests();
   });
 
+  await test('pumpLaunch: /launch caption parsing', async () => {
+    const { parseLaunchCommand, LaunchInputError } = require(src('pumpLaunch.js'));
+    const a = parseLaunchCommand('/launch My Coin | $MYC | 0.25 sol\nLine one\n\nLine two\nX: x.com/myc\ntg: https://t.me/myc\nwebsite: myc.io', { defaultBuySol: 0.1 });
+    check(a.name === 'My Coin' && a.symbol === 'MYC' && a.devBuySol === 0.25, `name/ticker/buy (got ${JSON.stringify(a)})`);
+    check(a.description === 'Line one\n\nLine two', `description keeps its lines (got ${JSON.stringify(a.description)})`);
+    check(a.twitter === 'https://x.com/myc' && a.telegram === 'https://t.me/myc' && a.website === 'https://myc.io/', 'links get https://');
+    const b = parseLaunchCommand('/launch@MyBot Coin | C', { defaultBuySol: 0.1 });
+    check(b.devBuySol === 0.1 && b.name === 'Coin', 'default dev buy when left out');
+    const c = parseLaunchCommand('/launch Coin | C | 0\nuri: https://ipfs.io/ipfs/abc');
+    check(c.devBuySol === 0 && c.uri === 'https://ipfs.io/ipfs/abc', 'create-only, ready-made metadata URI');
+    const bad = ['/launch', '/launch OnlyName', '/launch a | b | c | d', '/launch Coin | TOOLONGTICKER1 | 1', '/launch Coin | C | -1', '/launch Coin | C | lots', '/launch Coin | C | 1\nx: not a link at all'];
+    for (const t of bad) {
+      let threw = null;
+      try { parseLaunchCommand(t); } catch (e) { threw = e; }
+      check(threw instanceof LaunchInputError, `rejected: ${JSON.stringify(t)}`);
+    }
+  });
+
+  await test('pumpLaunch: create_v2 + dev buy built with the real SDK', async () => {
+    const script = `
+      const BN = require('bn.js');
+      const { PublicKey, Keypair } = require('@solana/web3.js');
+      const { TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync } = require('@solana/spl-token');
+      const sdk = require('@pump-fun/pump-sdk');
+      const feeRecipient = Keypair.generate().publicKey, reserved = Keypair.generate().publicKey;
+      const pumpGlobal = {
+        initialVirtualTokenReserves: new BN('1073000000000000'), initialVirtualSolReserves: new BN('30000000000'),
+        initialRealTokenReserves: new BN('793100000000000'), tokenTotalSupply: new BN('1000000000000000'),
+        feeBasisPoints: new BN(95), creatorFeeBasisPoints: new BN(30), creatorFeeConfigurable: false, mayhemModeEnabled: false,
+        createV2Enabled: true, isHolderRewardEnabled: false, maxConfigurableCreatorFeeBps: new BN(0),
+        feeRecipient, feeRecipients: [feeRecipient], reservedFeeRecipient: reserved, reservedFeeRecipients: [reserved]
+      };
+      const tier = { marketCapLamportsThreshold: new BN(0), fees: { lpFeeBps: new BN(0), protocolFeeBps: new BN(95), creatorFeeBps: new BN(30) } };
+      const L = require(${JSON.stringify(src('pumpLaunch.js'))});
+      const prewarm = require(${JSON.stringify(src('prewarm.js'))});
+      prewarm._setForTests({ blockhash: '11111111111111111111111111111111', pumpGlobal });
+      const user = Keypair.generate().publicKey;
+      const mint = Keypair.generate().publicKey;
+      const disc = (name) => Buffer.from(sdk.pumpIdl.instructions.find((i) => i.name === name).discriminator).toString('hex');
+      (async () => {
+        const out = {};
+        const { tx, tokensRaw } = await L.buildLaunchTx({ connection: {}, user, mint, name: 'Test', symbol: 'TST', uri: 'https://ipfs.io/ipfs/x', devBuySol: 0.5,
+          tipSol: 0.001, computeUnitLimit: 400000, priorityFeeMicroLamports: 1000, fetchFeeConfig: async () => ({ feeTiers: [tier], stableFeeTiers: [], flatFees: tier.fees, exoticFlatFees: tier.fees }) });
+        const msg = tx.message;
+        const keys = msg.staticAccountKeys.map((k) => k.toBase58());
+        out.signers = keys.slice(0, msg.header.numRequiredSignatures);
+        out.user = user.toBase58(); out.mint = mint.toBase58();
+        const progs = msg.compiledInstructions.map((ix) => keys[ix.programIdIndex]);
+        const pump = sdk.PUMP_PROGRAM_ID.toBase58();
+        const pumpIxs = msg.compiledInstructions.filter((ix) => keys[ix.programIdIndex] === pump).map((ix) => Buffer.from(ix.data));
+        out.pumpDiscs = pumpIxs.map((d) => d.subarray(0, 8).toString('hex'));
+        out.createV2 = disc('create_v2'); out.buy = disc('buy');
+        const buyData = pumpIxs[1];
+        out.buyTokens = buyData ? buyData.readBigUInt64LE(8).toString() : null;
+        out.buyMaxSol = buyData ? buyData.readBigUInt64LE(16).toString() : null;
+        out.tokensRaw = tokensRaw.toString();
+        out.hasAta = keys.includes(getAssociatedTokenAddressSync(mint, user, true, TOKEN_2022_PROGRAM_ID).toBase58());
+        out.programs = progs;
+        const only = await L.buildLaunchTx({ connection: {}, user, mint, name: 'Test', symbol: 'TST', uri: 'https://ipfs.io/ipfs/x', devBuySol: 0, computeUnitLimit: 400000 });
+        const k2 = only.tx.message.staticAccountKeys.map((k) => k.toBase58());
+        out.onlyDiscs = only.tx.message.compiledInstructions.filter((ix) => k2[ix.programIdIndex] === pump).map((ix) => Buffer.from(ix.data).subarray(0, 8).toString('hex'));
+        let off = null;
+        prewarm._setForTests({ pumpGlobal: { ...pumpGlobal, createV2Enabled: false } });
+        try { await L.buildLaunchTx({ connection: {}, user, mint, name: 'T', symbol: 'T', uri: 'https://x', devBuySol: 0, computeUnitLimit: 400000 }); } catch (e) { off = e.message; }
+        out.off = off;
+        console.log('__OUT__' + JSON.stringify(out));
+      })().catch((e) => { console.log('__OUT__' + JSON.stringify({ error: e.stack })); });
+    `;
+    const r = spawnSync(process.execPath, ['-e', script], { cwd: root, encoding: 'utf8' });
+    const line = (r.stdout || '').split('\n').find((l) => l.startsWith('__OUT__'));
+    if (!line) { check(false, `no output: ${r.stderr}`); return; }
+    const o = JSON.parse(line.slice(7));
+    if (o.error) { check(false, o.error); return; }
+    check(o.signers.length === 2 && o.signers[0] === o.user && o.signers.includes(o.mint), `signed by the wallet (payer) and the new mint (got ${o.signers})`);
+    check(o.pumpDiscs.length === 2 && o.pumpDiscs[0] === o.createV2 && o.pumpDiscs[1] === o.buy, `create_v2 then buy (got ${o.pumpDiscs})`);
+    check(o.hasAta, 'dev token account (Token-2022) created in the same tx');
+    check(o.buyTokens === o.tokensRaw && BigInt(o.tokensRaw) > 0n, `buy asks for the quoted tokens (${o.buyTokens} vs ${o.tokensRaw})`);
+    // 0.5 SOL less 1.25% fees on a fresh curve (30 SOL / 1.073B virtual): ~17.6M tokens.
+    const t = Number(o.tokensRaw) / 1e6;
+    check(t > 17e6 && t < 17.8e6, `dev buy size is right for 0.5 SOL on a new curve (got ${t})`);
+    check(BigInt(o.buyMaxSol) >= 500000000n && BigInt(o.buyMaxSol) <= 505000000n, `max SOL = the dev buy + 1% (got ${o.buyMaxSol})`);
+    check(o.onlyDiscs.length === 1 && o.onlyDiscs[0] === o.createV2, 'dev buy 0: create_v2 only');
+    check(/switched off/.test(o.off || ''), `create_v2 disabled on Pump.fun: clear error (got ${o.off})`);
+  });
+
   process.stdout.write('\n__UNIT__' + JSON.stringify(results) + '\n');
   process.exit(0);
 })();

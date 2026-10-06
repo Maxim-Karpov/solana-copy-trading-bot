@@ -772,6 +772,17 @@ to get both) to get a Telegram bot that can:
   positions are **not** sold. They stay in your wallet, and nothing manages
   them until you start the bot again. To restart, run `npm start` on the
   machine; the bot can't restart itself from Telegram.
+- **Launch a coin on Pump.fun**: send a photo with the caption
+  `/launch Name | TICKER | dev buy SOL` (description and `x:` / `tg:` /
+  `web:` links on the next lines). You get a preview with a **🚀 Launch**
+  button (valid 5 minutes); tapping it uploads the image and metadata
+  (`LAUNCH_IPFS_URL`), then sends one transaction that creates the coin
+  (`create_v2`) and makes the dev buy, simulated first. The dev buy becomes a
+  `LAUNCH` position with the usual sell buttons; the copy wallet's trades of
+  that coin never touch it, and it has no TP/SL. Limits: `LAUNCH_MAX_BUY_SOL`
+  (default 2), `MAX_BUY_AMOUNT`, `MAX_TOTAL_EXPOSURE`. One launch runs at a
+  time. Settings: `LAUNCH_ENABLED`, `LAUNCH_DEFAULT_BUY_SOL`,
+  `LAUNCH_PRIORITY_FEE_SOL`, `LAUNCH_COMPUTE_UNITS`, `LAUNCH_MAYHEM_MODE`.
 - `/help` lists the commands, and they also appear in Telegram's `/` menu.
 
 Taps and commands sent while the bot is offline are ignored when it starts,

@@ -183,6 +183,24 @@ function installMocks(rootDir, walletAddress) {
       }
       return sig;
     },
+    // /launch: the coin is created and the dev buy lands like any buy.
+    async launchToken({ mintKeypair, name, symbol, uri, devBuySol }) {
+      const mint = mintKeypair.publicKey.toBase58();
+      ledger.calls.launch = ledger.calls.launch || [];
+      ledger.calls.launch.push({ mint, name, symbol, uri, devBuySol });
+      const behaviour = ledger.launchQueue && ledger.launchQueue.length ? ledger.launchQueue.shift() : 'ok';
+      if (behaviour === 'throw') throw new Error('simulation failed: {"InstructionError":[2,{"Custom":6003}]}');
+      const sig = newSig('launch');
+      const lamportsSpent = BigInt(Math.round(devBuySol * 1e9));
+      const rent = 20_000_000n; // the coin's accounts
+      const tokenDelta = devBuySol > 0 ? uiToRaw((devBuySol / priceSol(mint)).toFixed(ledger.decimals), ledger.decimals) : 0n;
+      if (behaviour === 'failOnChain') {
+        settle(sig, { state: 'failed', err: { InstructionError: [3, { Custom: 6002 }] }, mint, lamportsDelta: -FEE_LAMPORTS, tokenDelta: 0n });
+      } else {
+        settle(sig, { state: 'confirmed', err: null, mint, lamportsDelta: -Number(lamportsSpent + rent) - FEE_LAMPORTS, tokenDelta });
+      }
+      return { signature: sig, tokensRaw: tokenDelta };
+    },
     async sellToken(args) {
       ledger.calls.sell.push({ ...args, at: Date.now() });
       const behaviour = ledger.sellQueue.length ? ledger.sellQueue.shift() : 'ok';
@@ -504,9 +522,23 @@ function installMocks(rootDir, walletAddress) {
   // ---- Telegram Bot API mock (intercepts fetch to api.telegram.org) ----
   // Any OTHER outbound fetch is an error: every network boundary is mocked,
   // so a real network call would mean something slipped past the mocks.
-  const telegram = { sent: [], answered: [], updates: [], nextUpdateId: 1, failSends: false, rateLimitSends: 0, failAnswers: false, networkDown: false, getUpdatesOffsets: [] };
+  const telegram = { sent: [], answered: [], updates: [], nextUpdateId: 1, failSends: false, rateLimitSends: 0, failAnswers: false, networkDown: false, getUpdatesOffsets: [], uploads: [], uploadFails: false };
   global.fetch = async (url, opts = {}) => {
     const u = String(url);
+    // /launch: Pump.fun's metadata upload (multipart form).
+    if (u === 'https://pump.fun/api/ipfs') {
+      const form = opts.body;
+      const fields = {};
+      for (const [k, v] of form.entries()) fields[k] = typeof v === 'string' ? v : { size: v.size, type: v.type, name: v.name };
+      telegram.uploads.push(fields);
+      const payload = telegram.uploadFails ? { error: 'bad image' } : { metadataUri: `https://ipfs.io/ipfs/meta${telegram.uploads.length}` };
+      return { ok: !telegram.uploadFails, status: telegram.uploadFails ? 400 : 200, text: async () => JSON.stringify(payload) };
+    }
+    // /launch: the photo's bytes.
+    if (u.startsWith('https://api.telegram.org/file/bot')) {
+      const bytes = Buffer.from('fake-jpeg-bytes');
+      return { ok: true, status: 200, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length) };
+    }
     if (!u.startsWith('https://api.telegram.org/')) throw new Error(`unexpected real network call to ${u}`);
     if (telegram.networkDown) throw new TypeError('fetch failed');
     const method = u.split('/').pop();
@@ -544,6 +576,7 @@ function installMocks(rootDir, walletAddress) {
       telegram.sent.push({ chatId: body.chat_id, text: body.text, opts: body.reply_markup ? { reply_markup: body.reply_markup } : undefined });
       return reply(true, {});
     }
+    if (method === 'getFile') return reply(true, { file_id: body.file_id, file_path: `photos/${body.file_id}.jpg` });
     if (method === 'answerCallbackQuery') {
       if (telegram.failAnswers) return reply(false, null, 'Bad Request: query is too old and response timeout expired');
       telegram.answered.push(body);
@@ -554,6 +587,9 @@ function installMocks(rootDir, walletAddress) {
   telegram.bot = {
     simulateText(text, chat, from) {
       telegram.updates.push({ update_id: telegram.nextUpdateId++, message: { text, chat, from } });
+    },
+    simulatePhoto(caption, chat, from) {
+      telegram.updates.push({ update_id: telegram.nextUpdateId++, message: { caption, chat, from, photo: [{ file_id: 'small', width: 90, height: 90 }, { file_id: 'big', width: 800, height: 800 }] } });
     },
     simulateCallback(data, chat, from) {
       telegram.updates.push({

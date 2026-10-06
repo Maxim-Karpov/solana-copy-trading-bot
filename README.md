@@ -7,10 +7,10 @@
 ![Node.js](https://img.shields.io/badge/node-%E2%89%A518.17-339933?logo=node.js&logoColor=white)
 ![Solana](https://img.shields.io/badge/Solana-mainnet-9945FF?logo=solana&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-190%20passing-2ea44f)
-![Version](https://img.shields.io/badge/version-3.37.2-blue)
+![Version](https://img.shields.io/badge/version-3.38.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-[Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Selling](#-selling-instant-sell-and-dca) · [Speed](#-built-for-speed) · [Rust fast path](#-rust-fast-path) · [Telegram](#-telegram-control) · [Reading the logs](#-reading-the-logs) · [Helius credits](#-helius-credits) · [Troubleshooting](#-troubleshooting) · [Full reference](docs/REFERENCE.md)
+[Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Selling](#-selling-instant-sell-and-dca) · [Speed](#-built-for-speed) · [Rust fast path](#-rust-fast-path) · [Telegram](#-telegram-control) · [Launching a coin](#-launching-a-coin) · [Reading the logs](#-reading-the-logs) · [Helius credits](#-helius-credits) · [Troubleshooting](#-troubleshooting) · [Full reference](docs/REFERENCE.md)
 
 </div>
 
@@ -261,6 +261,7 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and the bot reports every buy an
 | `/positions` | Open positions with **Sell 50%**, **Sell all** and **Keep** buttons, plus **Close all** and a pause/resume button |
 | `/pause` · `/resume` | Stop or restart copying buys (exits keep working) |
 | `/dca [instant\|even\|left]` | Show or change how positions are sold: instant, DCA even or DCA left. The choice is saved and survives restarts |
+| `/launch` | Create a new coin on Pump.fun with an optional dev buy (send it as a photo caption; see [Launching a coin](#-launching-a-coin)) |
 | `/stop` | Stop the bot after confirming (positions are **not** sold) |
 | `/help` | List commands |
 
@@ -273,6 +274,39 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and the bot reports every buy an
 Alerts cover anything that needs you: a feed down, a failed sell, a skipped buy and why, or a safety stop. Taps and commands sent while the bot is offline are ignored when it starts, so an old Sell button or `/stop` never fires later. Only the person whose id is `TELEGRAM_CHAT_ID`, in a private chat, can view positions or trigger a sell.
 
 **Keep.** In `EXACT` and `STIERED` modes the **📌 Keep** button makes the bot ignore the copy wallet's sells for that position; tap **▶ Follow** to go back to mirroring.
+
+## 🚀 Launching a coin
+
+Send your Telegram bot a **photo** (the coin's image) with a caption like this:
+
+```
+/launch My Coin | MYC | 0.5
+The description, over as many lines as you like.
+x: https://x.com/mycoin
+tg: https://t.me/mycoin
+web: https://mycoin.xyz
+```
+
+`Name | TICKER | dev buy in SOL`. The links are optional, and the dev buy can be left out (`LAUNCH_DEFAULT_BUY_SOL`, 0 by default) or set to `0` to create the coin without buying. An image sent as a file (uncompressed) works too.
+
+1. The bot replies with a **preview** and a **🚀 Launch** button (valid 5 minutes). Nothing is spent until you tap it.
+2. The image and metadata are uploaded through Pump.fun's own IPFS endpoint (`LAUNCH_IPFS_URL`).
+3. One transaction creates the coin (`create_v2`, a Token-2022 coin like Pump.fun's own) and makes your dev buy, signed by your wallet and a fresh mint key. It is simulated first, so a bad name or a Pump.fun change gives a clear reason instead of a failed transaction, then sent the same way as your buys (Helius Sender or Jito).
+4. The dev buy becomes a normal position with **Sell 50%**, **Sell all** and **Close all** buttons, and you get a 🚀 message with the coin's pump.fun and Axiom links.
+
+A launched coin's position (`trade_mode: LAUNCH`) is yours alone: the copy wallet buying or selling that coin never changes it, and it has no TP/SL. The dev buy is limited by `LAUNCH_MAX_BUY_SOL` (default 2) and `MAX_BUY_AMOUNT`, and counts toward `MAX_TOTAL_EXPOSURE`. On top of the dev buy, creating a coin costs about 0.02 SOL for its accounts plus the usual fee and tip; the position's cost includes those. If the bot stops between sending and saving, the dev buy is picked up on the next start like any other unsaved buy.
+
+| Setting | Default | |
+|---|---|---|
+| `LAUNCH_ENABLED` | `true` | `false` turns `/launch` off |
+| `LAUNCH_DEFAULT_BUY_SOL` | `0` | Dev buy when the caption leaves it out |
+| `LAUNCH_MAX_BUY_SOL` | `2` | Largest dev buy accepted |
+| `LAUNCH_PRIORITY_FEE_SOL` | `BUY_PRIORITY_FEE_SOL` | Priority fee for the launch transaction |
+| `LAUNCH_COMPUTE_UNITS` | `400000` | Compute-unit limit for it |
+| `LAUNCH_MAYHEM_MODE` | `false` | Create the coin in Pump.fun's mayhem mode |
+| `LAUNCH_IPFS_URL` | `https://pump.fun/api/ipfs` | Where the image and metadata are uploaded |
+
+Already have a metadata URI? Add a `uri: https://...` line and the upload is skipped (no photo needed).
 
 ---
 
@@ -377,6 +411,7 @@ src/
 ├── rpcPool.js          RPC failover and rate limiting
 ├── accountCleaner.js   closes empty token accounts to recover their deposits
 ├── telegramBot.js      Telegram control and notifications
+├── pumpLaunch.js       /launch: caption parsing, metadata upload, create + dev buy transaction
 └── storage.js          positions and saved choices on disk
 fastpath/               the Rust fast path (cargo build --release)
 scripts/                check-env · check-site · check-plain · vps-bench · leaders · shreder-check

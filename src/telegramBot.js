@@ -18,6 +18,7 @@ const { info, warn, error } = require('./logger');
 const { axiomLink } = require('./tokenLinks');
 const { fetchJson } = require('./timeouts');
 const coinInfo = require('./coinInfo');
+const pumpLaunch = require('./pumpLaunch');
 
 const LONG_POLL_SECONDS = 25;
 const CALL_TIMEOUT_MS = 15000;
@@ -38,6 +39,11 @@ const FOLLOWS_COPY_SELLS = new Set(['EXACT', 'STIERED']);
 let lastOffset = 0; // next update_id to ask Telegram for (= everything before it handled)
 const STOP_CONFIRM_TTL_MS = 2 * 60 * 1000;
 let getActivePositions = null; // injected by index.js via init()
+let launchCoin = null; // /launch: injected by index.js via init()
+// /launch previews waiting for the Launch button: id -> { fields, image, at }.
+const pendingLaunches = new Map();
+const LAUNCH_CONFIRM_TTL_MS = 5 * 60 * 1000;
+let launchBusy = false; // one launch at a time
 
 function isEnabled() {
   return Boolean(config.TELEGRAM_BOT_TOKEN && config.TELEGRAM_CHAT_ID);
@@ -157,6 +163,7 @@ function init(deps) {
   setKeep = deps.setKeep || null;
   getDcaMode = deps.getDcaMode || null;
   setDcaMode = deps.setDcaMode || null;
+  launchCoin = config.LAUNCH_ENABLED ? deps.launchCoin || null : null;
 
   if (!isEnabled()) {
     info('[TelegramBot] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; Telegram control bot disabled.');
@@ -175,6 +182,7 @@ function init(deps) {
       { command: 'pause', description: 'Pause new buys (exits keep working)' },
       { command: 'resume', description: 'Resume copying buys' },
       { command: 'dca', description: 'How positions are sold: instant, DCA even or DCA left' },
+      ...(launchCoin ? [{ command: 'launch', description: 'Launch a coin on Pump.fun (send a photo with this caption)' }] : []),
       { command: 'stop', description: 'Stop the bot (positions are not sold)' },
       { command: 'help', description: 'List commands' }
     ]
@@ -229,6 +237,14 @@ async function pollLoop(signal) {
 }
 
 async function handleUpdate(update) {
+  const m = update.message;
+  // /launch arrives as a photo (or an image sent as a file) with a caption, or as plain text (then: how to).
+  const launchText = m && (typeof m.caption === 'string' ? m.caption : typeof m.text === 'string' ? m.text : '');
+  if (m && /^\/launch\b/i.test(launchText || '')) {
+    if (!isAuthorized(m.chat, m.from)) return;
+    await prepareLaunch(m, launchText);
+    return;
+  }
   if (update.message && typeof update.message.text === 'string') {
     const msg = update.message;
     if (!isAuthorized(msg.chat, msg.from)) return;
@@ -257,6 +273,7 @@ const HELP_TEXT =
   '/pause — stop copying new buys (exits and sell buttons keep working)\n' +
   '/resume — start copying buys again\n' +
   '/dca — how positions are sold: /dca instant, /dca even (instant part, then equal slices), /dca left (25% of what is left each time)\n' +
+  '/launch — send a PHOTO with the caption "/launch Name | TICKER | dev buy SOL" (description and x:/tg:/web: links on the next lines) to create a coin on Pump.fun\n' +
   '/stop — stop the bot (asks to confirm; open positions are NOT sold)\n' +
   '/help — this list';
 
@@ -441,6 +458,10 @@ async function handleCallback(query) {
     await handleCloseAllCallback(query, chat, query.data);
     return;
   }
+  if (/^launch(go|no):/.test(query.data || '')) {
+    await handleLaunchCallback(query, chat, query.data);
+    return;
+  }
 
   // "keep:<id>" = stop following the copy wallet's sells for this position;
   // "follow:<id>" = follow them again.
@@ -477,6 +498,131 @@ async function handleCallback(query) {
     result = { ok: false, message: err.message };
   }
   await send(chat.id, result.ok ? `✅ ${result.message}` : `⚠️ ${result.message}`);
+}
+
+// ---- /launch ----
+
+const LAUNCH_HOWTO =
+  'To launch a coin, send a PHOTO (the coin image) with this caption:\n\n' +
+  '/launch Name | TICKER | 0.5\n' +
+  'Optional description on the next lines\n' +
+  'x: https://x.com/...\n' +
+  'tg: https://t.me/...\n' +
+  'web: https://...\n\n' +
+  'The last part is the dev buy in SOL (0 = create only). You get a preview with a Launch button first.';
+
+/** Telegram file -> { buffer, mime, filename }. */
+async function downloadTelegramFile(fileId, mimeHint, nameHint) {
+  const file = await callApi('getFile', { file_id: fileId });
+  if (!file || !file.file_path) throw new Error('Telegram gave no file path for the image');
+  const url = `https://api.telegram.org/file/bot${config.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(CALL_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`image download failed: HTTP ${res.status}`);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const ext = (file.file_path.split('.').pop() || '').toLowerCase();
+  const byExt = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
+  const mime = mimeHint && pumpLaunch.IMAGE_TYPES.has(mimeHint) ? mimeHint : byExt[ext] || 'image/jpeg';
+  return { buffer, mime, filename: nameHint || `image.${ext || 'jpg'}` };
+}
+
+/** The image in a message: the largest photo size, or an image sent as a file. */
+function imageOf(msg) {
+  if (Array.isArray(msg.photo) && msg.photo.length) {
+    const best = msg.photo.reduce((a, b) => ((b.file_size || b.width * b.height) > (a.file_size || a.width * a.height) ? b : a));
+    return { fileId: best.file_id, mime: 'image/jpeg', name: 'image.jpg' };
+  }
+  if (msg.document && /^image\//.test(msg.document.mime_type || '')) {
+    return { fileId: msg.document.file_id, mime: msg.document.mime_type, name: msg.document.file_name || null };
+  }
+  return null;
+}
+
+/** Step 1: read the caption and image, show a preview with Launch / Cancel. */
+async function prepareLaunch(msg, text) {
+  const chatId = msg.chat.id;
+  if (!launchCoin) {
+    await send(chatId, config.LAUNCH_ENABLED ? 'Launching is not available.' : 'Launching is off (LAUNCH_ENABLED=false).');
+    return;
+  }
+  let fields;
+  try {
+    fields = pumpLaunch.parseLaunchCommand(text, { defaultBuySol: config.LAUNCH_DEFAULT_BUY_SOL });
+  } catch (err) {
+    await send(chatId, `⚠️ ${err.message}\n\n${LAUNCH_HOWTO}`);
+    return;
+  }
+  const img = imageOf(msg);
+  if (!img && !fields.uri) {
+    await send(chatId, LAUNCH_HOWTO);
+    return;
+  }
+  let image = null;
+  if (img && !fields.uri) {
+    try {
+      image = await downloadTelegramFile(img.fileId, img.mime, img.name);
+    } catch (err) {
+      await send(chatId, `⚠️ Couldn't get the image from Telegram: ${err.message}`);
+      return;
+    }
+  }
+  const cap = Math.min(config.LAUNCH_MAX_BUY_SOL, config.MAX_BUY_AMOUNT);
+  if (fields.devBuySol > cap) {
+    await send(chatId, `⚠️ Dev buy ${fields.devBuySol} SOL is above the limit of ${cap} SOL (LAUNCH_MAX_BUY_SOL / MAX_BUY_AMOUNT).`);
+    return;
+  }
+  for (const [k, v] of pendingLaunches) if (Date.now() - v.at > LAUNCH_CONFIRM_TTL_MS) pendingLaunches.delete(k);
+  const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  pendingLaunches.set(id, { fields, image, at: Date.now() });
+  const links = [fields.twitter && `X: ${fields.twitter}`, fields.telegram && `Telegram: ${fields.telegram}`, fields.website && `Web: ${fields.website}`].filter(Boolean);
+  await send(
+    chatId,
+    `Launch this coin on Pump.fun?\n\n` +
+      `Name: ${fields.name}\nTicker: $${fields.symbol}\n` +
+      `Dev buy: ${fields.devBuySol > 0 ? `${fields.devBuySol} SOL (becomes a position with sell buttons)` : 'none (create only)'}\n` +
+      (fields.description ? `Description: ${fields.description.slice(0, 300)}${fields.description.length > 300 ? '…' : ''}\n` : '') +
+      (links.length ? `${links.join('\n')}\n` : '') +
+      (fields.uri ? `Metadata: ${fields.uri}\n` : `Image: ${image ? `${Math.round(image.buffer.length / 1024)} KB ${image.mime}` : 'none'}\n`) +
+      `Network fees, tip and ~0.02 SOL for the coin's accounts come on top. The button expires in ${LAUNCH_CONFIRM_TTL_MS / 60000} minutes.`,
+    { reply_markup: { inline_keyboard: [[{ text: '🚀 Launch', callback_data: `launchgo:${id}` }, { text: 'Cancel', callback_data: `launchno:${id}` }]] } }
+  );
+}
+
+/** Step 2: the Launch (or Cancel) button. */
+async function handleLaunchCallback(query, chat, data) {
+  const [, action, id] = /^launch(go|no):(.+)$/.exec(data);
+  const pending = pendingLaunches.get(id);
+  pendingLaunches.delete(id); // each preview launches at most once
+  if (action === 'no') {
+    await answer(query, 'Cancelled.');
+    await send(chat.id, 'OK, nothing launched.');
+    return;
+  }
+  if (!pending || Date.now() - pending.at > LAUNCH_CONFIRM_TTL_MS) {
+    await answer(query, 'Expired.');
+    await send(chat.id, 'That launch button has expired (or was already used). Send the photo with /launch again.');
+    return;
+  }
+  if (launchBusy) {
+    pendingLaunches.set(id, pending); // still usable once the other one is done
+    await answer(query, 'Another launch is running.');
+    await send(chat.id, 'Another launch is still running; tap Launch again when it has finished.');
+    return;
+  }
+  if (!launchCoin) {
+    await answer(query, 'Not available.');
+    return;
+  }
+  launchBusy = true;
+  await answer(query, 'Launching...');
+  let result;
+  try {
+    result = await launchCoin({ ...pending.fields, image: pending.image, progress: (t) => send(chat.id, t) });
+  } catch (err) {
+    result = { ok: false, message: err.message };
+  } finally {
+    launchBusy = false;
+  }
+  await send(chat.id, result.ok ? result.message : `⚠️ ${result.message}`);
 }
 
 function pauseButton() {
@@ -521,8 +667,18 @@ async function sendPositionsList(chatId) {
 
 /** Notify on a new buy (or an added-to position), then send the positions
  * list with its sell buttons right away so you can exit quickly. */
-function notifyBuy(pos, { added = false, slotsBehind = null, reactionMs = null, coinSnapshot = null, vsCopy = null, pairedStock = null, blockRate = '' } = {}) {
+function notifyBuy(pos, { added = false, slotsBehind = null, reactionMs = null, coinSnapshot = null, vsCopy = null, pairedStock = null, blockRate = '', launched = null } = {}) {
   if (!started) return;
+  if (launched) {
+    (async () => {
+      await send(
+        config.TELEGRAM_CHAT_ID,
+        `🚀 LAUNCHED ${launched.name} ($${launched.symbol}): dev buy ${positionLabel(pos)}\nTokens: ${pos.token_amount}\nhttps://pump.fun/coin/${pos.mint}\n${axiomLink(pos.mint)}`
+      );
+      await sendPositionsList(config.TELEGRAM_CHAT_ID);
+    })().catch((err) => warn('[TelegramBot] Post-launch positions list failed:', err.message));
+    return;
+  }
   let speed = '';
   if (typeof slotsBehind === 'number') {
     speed = `\nLanded ${slotsBehind} slot${slotsBehind === 1 ? '' : 's'} behind the copy wallet (~${(slotsBehind * 0.4).toFixed(1)}s)`;

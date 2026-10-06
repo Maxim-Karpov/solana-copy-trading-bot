@@ -512,6 +512,31 @@ if (config.SEND_VIA === 'sender' && !(config.BUY_PRIORITY_FEE_SOL > 0)) {
 if (config.BUY_PRIORITY_FEE_SOL > 0.5) {
   console.warn(`[config] WARNING: BUY_PRIORITY_FEE_SOL=${config.BUY_PRIORITY_FEE_SOL} SOL per buy — that's very high (it is paid even when a buy is cancelled).`);
 }
+// --- Launching coins from Telegram (/launch) ---
+// A photo sent to the Telegram bot with "/launch Name | TICKER | dev buy SOL"
+// as its caption creates the coin on Pump.fun (create_v2) with your dev buy
+// in the same transaction; the dev buy then becomes a normal position with
+// sell buttons. Only works with the Telegram bot set up. Off with "false".
+config.LAUNCH_ENABLED = process.env.LAUNCH_ENABLED !== 'false';
+// Dev buy when the caption leaves it out (0 = create only, no buy).
+config.LAUNCH_DEFAULT_BUY_SOL = numEnv('LAUNCH_DEFAULT_BUY_SOL', { def: 0, min: 0 });
+// Largest dev buy /launch accepts (also never above MAX_BUY_AMOUNT, and it
+// counts toward MAX_TOTAL_EXPOSURE like any position).
+config.LAUNCH_MAX_BUY_SOL = numEnv('LAUNCH_MAX_BUY_SOL', { def: 2, min: 0 });
+// Where the image and metadata are uploaded (Pump.fun's own IPFS endpoint).
+config.LAUNCH_IPFS_URL = process.env.LAUNCH_IPFS_URL || 'https://pump.fun/api/ipfs';
+// Priority fee for the launch transaction (default: BUY_PRIORITY_FEE_SOL) and its compute-unit limit.
+config.LAUNCH_PRIORITY_FEE_SOL = numEnv('LAUNCH_PRIORITY_FEE_SOL', { def: config.BUY_PRIORITY_FEE_SOL, min: 0 });
+config.LAUNCH_COMPUTE_UNITS = numEnv('LAUNCH_COMPUTE_UNITS', { def: 400_000, min: 100_000, max: 1_400_000, integer: true });
+// Create the coin in Pump.fun's mayhem mode.
+config.LAUNCH_MAYHEM_MODE = process.env.LAUNCH_MAYHEM_MODE === 'true';
+if (config.SEND_VIA === 'sender' && config.LAUNCH_ENABLED && !(config.LAUNCH_PRIORITY_FEE_SOL > 0)) {
+  fail('SEND_VIA="sender" requires LAUNCH_PRIORITY_FEE_SOL greater than 0 (Helius Sender rejects transactions without a priority fee).');
+}
+if (config.LAUNCH_DEFAULT_BUY_SOL > config.LAUNCH_MAX_BUY_SOL) {
+  fail(`LAUNCH_DEFAULT_BUY_SOL (${config.LAUNCH_DEFAULT_BUY_SOL}) is larger than LAUNCH_MAX_BUY_SOL (${config.LAUNCH_MAX_BUY_SOL}).`);
+}
+
 if (config.PRIORITY_FEE_SOL > 0.01 || config.SENDER_TIP > 0.05 || config.SELL_SENDER_TIP > 0.05) {
   console.warn(
     `[config] WARNING: PRIORITY_FEE_SOL=${config.PRIORITY_FEE_SOL} / SENDER_TIP=${config.SENDER_TIP} SOL per transaction — that's unusually high.`

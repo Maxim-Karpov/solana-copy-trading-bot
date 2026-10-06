@@ -9,6 +9,17 @@
 const SECOND_WALLET = require('@solana/web3.js').Keypair.fromSeed(new Uint8Array(32).fill(7)).publicKey.toBase58();
 const TIERS = '[{"maxSol":0.5,"buyAmount":0.05},{"maxSol":2,"buyAmount":0.15},{"maxSol":null,"buyAmount":0.3}]';
 
+/** The pending-buy notes on disk (storage.js: pending-buys.json). */
+function launchPendingBuys(h) {
+  const file = require('path').join(require('path').dirname(h.posFile), 'pending-buys.json');
+  try {
+    const v = JSON.parse(require('fs').readFileSync(file, 'utf8'));
+    return Array.isArray(v) ? v : v.buys || [];
+  } catch {
+    return [];
+  }
+}
+
 function seedPosition(overrides) {
   return {
     id: overrides.id,
@@ -2185,6 +2196,119 @@ module.exports = {
       h.ledger.prices.set(m, 0.00115); // 11.5% below peak
       const closed = await h.waitFor(() => h.byMint(m).find((p) => p.status === 'closed'), 'TSL close');
       h.check(closed.close_reason === 'TSL', `close_reason TSL (got ${closed.close_reason})`);
+    }
+  }
+,
+
+  // /launch: photo + caption -> preview -> Launch -> coin created, dev buy saved as a LAUNCH position.
+  launch_from_telegram_opens_dev_position: {
+    env: { TELEGRAM_BOT_TOKEN: 'test-token', TELEGRAM_CHAT_ID: '777', TRADE_TYPE: 'EXACT' },
+    async run(h) {
+      const me = { chat: { id: 777, type: 'private' }, from: { id: 777 } };
+      await h.sleep(200);
+      h.telegram.bot.simulatePhoto('/launch Test Coin | $TEST | 0.5\nThe best test coin.\nSecond line.\nx: x.com/testcoin\nweb: https://test.example', me.chat, me.from);
+      const preview = await h.waitFor(() => h.telegram.sent.find((m) => /Launch this coin/.test(m.text)), 'launch preview with buttons');
+      h.check(/Name: Test Coin/.test(preview.text) && /Ticker: \$TEST/.test(preview.text) && /Dev buy: 0\.5 SOL/.test(preview.text), `preview shows the coin (got ${preview.text})`);
+      const go = preview.opts.reply_markup.inline_keyboard[0][0].callback_data;
+      h.check(/^launchgo:/.test(go), 'Launch button');
+      h.check(!h.ledger.calls.launch, 'nothing launched before the button');
+
+      h.telegram.bot.simulateCallback(go, me.chat, me.from);
+      const pos = await h.waitFor(() => h.active().find((p) => p.trade_mode === 'LAUNCH'), 'dev position opened');
+      const call = h.ledger.calls.launch[0];
+      const up = h.telegram.uploads[0];
+      h.check(up && up.name === 'Test Coin' && up.symbol === 'TEST' && up.description === 'The best test coin.\nSecond line.', `metadata uploaded (got ${JSON.stringify(up)})`);
+      h.check(up && up.twitter === 'https://x.com/testcoin' && up.website === 'https://test.example/' && up.file && up.file.size > 0 && up.file.type === 'image/jpeg', 'links and the image go with it');
+      h.check(call.uri === 'https://ipfs.io/ipfs/meta1' && call.devBuySol === 0.5 && call.symbol === 'TEST', `launched with the uploaded metadata (got ${JSON.stringify(call)})`);
+      h.check(pos.mint === call.mint && pos.copy_wallet === null && pos.venue === 'pumpfun' && pos.pool === 'pump-curve', 'position is the new coin, on the Pump.fun curve, no copy wallet');
+      h.check(pos.token_amount === '50000.000000', `dev buy tokens recorded (got ${pos.token_amount})`);
+      h.approx(pos.cost_basis_sol, 0.520005, 1e-9, 'cost includes the coin accounts and fee');
+      await h.waitFor(() => h.telegram.sent.find((m) => /LAUNCHED Test Coin/.test(m.text) && m.text.includes(`pump.fun/coin/${pos.mint}`)), 'launch notification');
+      await h.waitFor(() => h.telegram.sent.find((m) => m.opts && JSON.stringify(m.opts).includes(`sell:${pos.id}`)), 'sell buttons for the dev position');
+      h.check(launchPendingBuys(h).length === 0, 'no pending buy left behind');
+
+      // The copy wallet trading the coin never touches the dev position.
+      h.sell(pos.mint, 100);
+      await h.waitFor(() => h.logs.some((l) => l.includes('a coin you launched; your dev position is sold only by you')), 'copy sell ignored');
+      h.buy(pos.mint, 1.0);
+      await h.waitFor(() => h.logs.some((l) => l.includes('a coin you launched; not adding')), 'copy buy ignored');
+      h.check(h.ledger.calls.buy.length === 0 && h.ledger.calls.sell.length === 0, 'no copy trades on the launched coin');
+
+      // Sold with the Telegram button like any position.
+      h.telegram.bot.simulateCallback(`sell:${pos.id}`, me.chat, me.from);
+      const closed = await h.waitFor(() => h.byMint(pos.mint).find((p) => p.status === 'closed'), 'dev position sold from Telegram');
+      h.check(/Telegram manual sell/.test(closed.close_reason), `closed by the button (got ${closed.close_reason})`);
+    }
+  },
+
+  launch_refusals_and_failures: {
+    env: { TELEGRAM_BOT_TOKEN: 'test-token', TELEGRAM_CHAT_ID: '777', LAUNCH_MAX_BUY_SOL: '1' },
+    async run(h) {
+      const me = { chat: { id: 777, type: 'private' }, from: { id: 777 } };
+      const stranger = { chat: { id: 555, type: 'private' }, from: { id: 555 } };
+      await h.sleep(200);
+      const after = (n, re, label) => h.waitFor(() => h.telegram.sent.slice(n).find((m) => re.test(m.text)), label);
+
+      // Text only: how to.
+      let n = h.telegram.sent.length;
+      h.telegram.bot.simulateText('/launch', me.chat, me.from);
+      await after(n, /send a PHOTO/, 'how-to for /launch without a photo');
+
+      // Over the dev buy limit: refused before any preview.
+      n = h.telegram.sent.length;
+      h.telegram.bot.simulatePhoto('/launch Big | BIG | 5', me.chat, me.from);
+      await after(n, /above the limit of 1 SOL/, 'dev buy over LAUNCH_MAX_BUY_SOL refused');
+
+      // Bad caption.
+      n = h.telegram.sent.length;
+      h.telegram.bot.simulatePhoto('/launch A name far too long for the Pump.fun limit | X | 0.1', me.chat, me.from);
+      await after(n, /name is too long/, 'long name refused');
+
+      // Someone else: ignored.
+      n = h.telegram.sent.length;
+      h.telegram.bot.simulatePhoto('/launch Nope | NOPE | 0.1', stranger.chat, stranger.from);
+      await h.sleep(400);
+      h.check(!h.telegram.sent.slice(n).some((m) => /Launch this coin/.test(m.text)), 'no preview for a stranger');
+
+      // Cancel.
+      n = h.telegram.sent.length;
+      h.telegram.bot.simulatePhoto('/launch Cancel Me | CNCL | 0.1', me.chat, me.from);
+      let preview = await after(n, /Launch this coin/, 'preview');
+      h.telegram.bot.simulateCallback(preview.opts.reply_markup.inline_keyboard[0][1].callback_data, me.chat, me.from);
+      await after(n, /nothing launched/, 'cancelled');
+      // The used preview's Launch button no longer works.
+      n = h.telegram.sent.length;
+      h.telegram.bot.simulateCallback(preview.opts.reply_markup.inline_keyboard[0][0].callback_data, me.chat, me.from);
+      await after(n, /expired \(or was already used\)/, 'cancelled preview cannot launch');
+
+      // Fails on-chain: reported, no position, no pending buy.
+      h.ledger.launchQueue = ['failOnChain'];
+      n = h.telegram.sent.length;
+      h.telegram.bot.simulatePhoto('/launch Fails | FAIL | 0.2', me.chat, me.from);
+      preview = await after(n, /Launch this coin/, 'preview');
+      h.telegram.bot.simulateCallback(preview.opts.reply_markup.inline_keyboard[0][0].callback_data, me.chat, me.from);
+      await after(n, /Launch failed on-chain/, 'on-chain failure reported');
+      h.check(!h.active().some((p) => p.trade_mode === 'LAUNCH'), 'no position for a failed launch');
+      h.check(launchPendingBuys(h).length === 0, 'its pending note is dropped');
+
+      // Upload fails: nothing sent.
+      h.telegram.uploadFails = true;
+      n = h.telegram.sent.length;
+      h.telegram.bot.simulatePhoto('/launch NoMeta | NOMETA | 0.2', me.chat, me.from);
+      preview = await after(n, /Launch this coin/, 'preview');
+      h.telegram.bot.simulateCallback(preview.opts.reply_markup.inline_keyboard[0][0].callback_data, me.chat, me.from);
+      await after(n, /Metadata upload failed/, 'upload failure reported');
+      h.check(h.ledger.calls.launch.length === 1, 'no launch sent without metadata');
+
+      // Create only (dev buy 0): no position.
+      h.telegram.uploadFails = false;
+      n = h.telegram.sent.length;
+      h.telegram.bot.simulatePhoto('/launch Free | FREE | 0', me.chat, me.from);
+      preview = await after(n, /Launch this coin/, 'preview');
+      h.check(/Dev buy: none/.test(preview.text), 'preview says no dev buy');
+      h.telegram.bot.simulateCallback(preview.opts.reply_markup.inline_keyboard[0][0].callback_data, me.chat, me.from);
+      await after(n, /FREE\) is live/, 'create-only launch reported');
+      h.check(!h.active().some((p) => p.trade_mode === 'LAUNCH'), 'no position without a dev buy');
     }
   }
 };

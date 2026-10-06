@@ -48,6 +48,7 @@ const { computeTieredBuyAmount } = require('./tieredBuy');
 const { axiomLink } = require('./tokenLinks');
 const rpcPool = require('./rpcPool');
 const telegramBot = require('./telegramBot');
+const pumpLaunch = require('./pumpLaunch');
 const { measureWalletDeltas, MAX_TX_VERSION } = require('./txParser');
 const { decodePumpTradeDetails, swapPrice } = require('./fastPumpParser');
 const coinInfo = require('./coinInfo');
@@ -104,6 +105,8 @@ const SHUTDOWN_POLL_INTERVAL_MS = 200;
 // exit on our own TP/SL. Keyed off each POSITION's own trade_mode, so
 // changing TRADE_TYPE and restarting doesn't strand older positions.
 const MIRRORS_COPY_SELLS = new Set(['EXACT', 'STIERED']);
+// The "copy wallet" of a coin you launched yourself (/launch): matches no real wallet.
+const LAUNCH_OWNER = 'launch';
 const USES_TP_SL = new Set(['SAFE', 'TIERED']);
 
 function num(v, fallback = 0) {
@@ -332,6 +335,8 @@ process.on('uncaughtException', (err) => {
     const MULTI_WALLET = config.COPY_WALLETS.length > 1;
     /** The copy wallet a position follows (older positions: the first one). */
     function walletOf(pos) {
+      // A coin you launched (/launch) follows no copy wallet: their trades of it never touch it.
+      if (pos.trade_mode === 'LAUNCH') return LAUNCH_OWNER;
       return pos.copy_wallet || config.COPY_WALLET;
     }
     /** " (4vw5…9Ud9)" in log lines when several wallets are copied. */
@@ -1901,6 +1906,10 @@ process.on('uncaughtException', (err) => {
         info(`[Main] Copy wallet${who(wallet)} bought ${mint}, which is already being bought; not buying it again.`);
         return;
       }
+      if (existing && existing.trade_mode === 'LAUNCH') {
+        info(`[Main] Copy wallet${who(wallet)} bought ${mint}, a coin you launched; not adding to your dev position.`);
+        return;
+      }
       if (existing && walletOf(existing) !== wallet) {
         // Bought on another copy wallet's buy: that wallet's trades run it.
         info(`[Main] Copy wallet${who(wallet)} bought ${mint}, which you already hold from${who(walletOf(existing))}'s buy; not adding to it.`);
@@ -2515,7 +2524,8 @@ process.on('uncaughtException', (err) => {
       // Only positions bought on this wallet's buys follow its sells.
       const positions = held.filter((p) => walletOf(p) === wallet);
       if (positions.length === 0) {
-        if (held.length) info(`[Main] Copy wallet${who(wallet)} ${moved} ${mint}; your position follows${who(walletOf(held[0]))} instead, ignoring.`);
+        if (held.length && held[0].trade_mode === 'LAUNCH') info(`[Main] Copy wallet${who(wallet)} ${moved} ${mint}, a coin you launched; your dev position is sold only by you, ignoring.`);
+        else if (held.length) info(`[Main] Copy wallet${who(wallet)} ${moved} ${mint}; your position follows${who(walletOf(held[0]))} instead, ignoring.`);
         else if (!viaTransfer) info(`[Main] Copy sell ${mint}${who(wallet)} but no active position, ignoring.`);
         return;
       }
@@ -3059,8 +3069,144 @@ process.on('uncaughtException', (err) => {
       });
     });
 
+    // --- /launch: create a coin on Pump.fun, the dev buy becomes a position ---
+    // Checks (dev buy caps, exposure, balance), metadata upload, then one
+    // transaction: create + dev buy. The dev buy is saved as a LAUNCH position:
+    // no copy wallet's trades touch it, and it has no TP/SL; you sell it with
+    // the Telegram buttons (Sell 50% / Sell all / Close all).
+    const LAUNCH_FEE_RESERVE_SOL = 0.05; // the coin's accounts (~0.02 SOL), fees, tip
+    async function launchCoin({ name, symbol, description = '', twitter = '', telegram = '', website = '', uri = '', devBuySol = 0, image = null, progress = () => {} }) {
+      if (shuttingDown) return { ok: false, message: 'The bot is shutting down.' };
+      if (!config.LAUNCH_ENABLED) return { ok: false, message: 'Launching is off (LAUNCH_ENABLED=false).' };
+      const cap = Math.min(config.LAUNCH_MAX_BUY_SOL, config.MAX_BUY_AMOUNT);
+      if (devBuySol > cap) {
+        return { ok: false, message: `Dev buy ${devBuySol} SOL is above the limit of ${cap} SOL (LAUNCH_MAX_BUY_SOL ${config.LAUNCH_MAX_BUY_SOL}, MAX_BUY_AMOUNT ${config.MAX_BUY_AMOUNT}).` };
+      }
+      if (devBuySol > 0 && currentExposureSol() + devBuySol > config.MAX_TOTAL_EXPOSURE) {
+        return { ok: false, message: `A ${devBuySol} SOL dev buy would take you over MAX_TOTAL_EXPOSURE (${config.MAX_TOTAL_EXPOSURE} SOL; ${currentExposureSol().toFixed(3)} SOL committed now).` };
+      }
+      await refreshBalance();
+      if (walletSol !== null && walletSol < devBuySol + LAUNCH_FEE_RESERVE_SOL) {
+        return { ok: false, message: `Wallet has ${walletSol.toFixed(4)} SOL; a launch with a ${devBuySol} SOL dev buy needs about ${(devBuySol + LAUNCH_FEE_RESERVE_SOL).toFixed(3)} SOL.` };
+      }
+
+      let metadataUri = uri;
+      if (!metadataUri) {
+        progress('⬆️ Uploading image and metadata...');
+        try {
+          metadataUri = await pumpLaunch.uploadMetadata({ url: config.LAUNCH_IPFS_URL, image, name, symbol, description, twitter, telegram, website });
+        } catch (err) {
+          return { ok: false, message: err.message };
+        }
+        info(`[Main] /launch ${symbol}: metadata at ${metadataUri}`);
+      }
+      if (shuttingDown) return { ok: false, message: 'The bot is shutting down.' };
+
+      const mintKeypair = Keypair.generate();
+      const mint = mintKeypair.publicKey.toBase58();
+      // Counted like any buy in flight, so copy buys meanwhile see the SOL taken.
+      pendingBuySol += devBuySol;
+      if (devBuySol > 0) pendingNewPositions += 1;
+      buyingMints.set(mint, 1);
+      let reserved = true;
+      const release = () => {
+        if (!reserved) return;
+        reserved = false;
+        pendingBuySol = Math.max(0, pendingBuySol - devBuySol);
+        if (devBuySol > 0) pendingNewPositions = Math.max(0, pendingNewPositions - 1);
+        buyingMints.delete(mint);
+      };
+
+      return tracked(() =>
+        runExclusive(mint, async () => {
+          let sig = null;
+          try {
+            progress(`🚀 Creating ${symbol}${devBuySol > 0 ? ` with a ${devBuySol} SOL dev buy` : ''}...`);
+            try {
+              sig = (await tradeExecutorMod.launchToken({ mintKeypair, name, symbol, uri: metadataUri, devBuySol })).signature;
+            } catch (err) {
+              if (!err || !err.txSignature) {
+                warn(`[Main] /launch ${symbol} not sent: ${err.message}`);
+                return { ok: false, message: `Launch not sent: ${err.message}` };
+              }
+              sig = err.txSignature; // may have gone out: follow it
+              warn(`[Main] /launch ${symbol}: ${err.message}; checking whether it landed.`);
+            }
+            if (devBuySol > 0) {
+              buysInFlight.add(sig);
+              try {
+                storage.addPendingBuy({ signature: sig, mint, sol: devBuySol, at: Date.now(), wallet: null, venue: 'pumpfun', dex: 'pumpfun', pool: 'pump-curve', parent: null, mode: 'LAUNCH' });
+              } catch (err) {
+                warn(`[Main] Couldn't note launch ${sig.slice(0, 8)}… on disk (${err.message}).`);
+              }
+            }
+            const conf = await waitForConfirmation(sig, Math.max(config.CONFIRM_TIMEOUT_SEC, 30));
+            if (!conf.confirmed) {
+              if (conf.err) {
+                dropPendingBuy(sig);
+                const why = explainTxError(conf.err, 'pump-curve');
+                warn(`[Main] /launch ${symbol} FAILED on-chain: ${why}`);
+                return { ok: false, message: `Launch failed on-chain: ${why}\nhttps://solscan.io/tx/${sig}` };
+              }
+              const msg = `Launch ${sig} of ${symbol} wasn't confirmed in time. If it lands, the coin is ${mint}` + (devBuySol > 0 ? ' and its dev buy is picked up as a position by the regular check.' : '.');
+              warn(`[Main] ${msg}`);
+              return { ok: false, message: msg };
+            }
+            info(`[Main] /launch ${symbol} confirmed: coin ${mint}, tx ${sig}.`);
+            refreshBalance();
+            if (!(devBuySol > 0)) return { ok: true, mint, signature: sig, message: `✅ ${name} ($${symbol}) is live: ${mint}\nhttps://pump.fun/coin/${mint}` };
+
+            const fill = await measureBuy(sig, mint, devBuySol);
+            const unknownFill = fill.receivedRaw === null;
+            if (!unknownFill && !(fill.receivedRaw > 0n)) {
+              dropPendingBuy(sig);
+              return { ok: false, mint, signature: sig, message: `${symbol} was created (${mint}) but the dev buy delivered no tokens.` };
+            }
+            const newPos = storage.addPosition({
+              mint,
+              buy_amount: devBuySol,
+              cost_basis_sol: fill.costSol, // includes creating the coin's accounts
+              swap_cost_sol: typeof fill.swapCostSol === 'number' ? fill.swapCostSol : fill.costSol,
+              token_amount: unknownFill ? '0' : rawToUi(fill.receivedRaw, fill.decimals),
+              decimals: unknownFill ? null : fill.decimals,
+              needs_reconcile: unknownFill,
+              entry_price: 0, // the first price the polling loop sees
+              current_price: 0,
+              highest_price: 0,
+              trade_mode: 'LAUNCH',
+              parent_signature: null,
+              buy_signature: sig,
+              copy_wallet: null,
+              stop_loss_pct: null,
+              take_profit_pct: null,
+              dex: 'pumpfun',
+              venue: 'pumpfun',
+              pool: 'pump-curve',
+              realized_pnl_sol: 0,
+              trailing_stop_distance: null,
+              trailing_stop_activation: null,
+              sell_after_at: null,
+              launched: { name, symbol, uri: metadataUri }
+            });
+            activeMap.set(newPos.id, { ...newPos });
+            release();
+            stateChanged();
+            dropPendingBuy(sig);
+            const pos = activeMap.get(newPos.id);
+            info(`[Main] Dev position ID=${pos.id}, mint=${mint}, tokens=${pos.token_amount}, cost=${num(pos.cost_basis_sol).toFixed(4)} SOL.`);
+            telegramBot.notifyBuy(pos, { launched: { name, symbol } });
+            return { ok: true, mint, signature: sig, message: `✅ ${name} ($${symbol}) is live: ${mint}\nhttps://pump.fun/coin/${mint}` };
+          } finally {
+            release();
+            if (sig) buysInFlight.delete(sig);
+          }
+        })
+      );
+    }
+
     // --- Optional Telegram control bot (no-op if not configured) ---
     telegramBot.init({
+      launchCoin,
       getActivePositions: () => Array.from(activeMap.values()).filter((p) => p.status === 'active'),
       sellPositionById: async (id, pct = 100) => {
         if (shuttingDown) return { ok: false, message: 'The bot is shutting down.' };

@@ -139,6 +139,8 @@ function prepareAndSign(tx, opts = {}) {
   }
 
   signTx(tx, walletKeypair);
+  // Co-signers (a new coin's mint keypair, for /launch).
+  for (const kp of opts.extraSigners || []) signTx(tx, kp);
   // A transaction's signature is its id — known before we send it.
   const txSignature = bs58.encode(tx.signatures[0]);
   return { tx, viaSender, txSignature };
@@ -148,6 +150,17 @@ async function signAndSendTx(tx, opts = {}) {
   const prepared = prepareAndSign(tx, opts);
   tx = prepared.tx;
   const { viaSender, txSignature } = prepared;
+
+  // Run it once on the RPC first (only where asked: /launch, where a few
+  // hundred ms don't matter but a clear reason for a failure does).
+  if (opts.simulate) {
+    const sim = await rpcPool.withFailover((c) => c.simulateTransaction(tx, { sigVerify: false, commitment: 'processed' }));
+    const v = sim && sim.value;
+    if (v && v.err) {
+      const logs = (v.logs || []).filter((l) => /error|failed|Error Message/i.test(l)).slice(-3).join(' | ');
+      throw new Error(`simulation failed: ${JSON.stringify(v.err)}${logs ? ` (${logs})` : ''}`);
+    }
+  }
 
   if (viaSender) {
     const raw = Buffer.from(tx.serialize());
@@ -1015,7 +1028,41 @@ async function buyTokenViaJupiter(mint, amountSol) {
   return signAndSendTx(built.tx);
 }
 
+/**
+ * /launch: create a coin on Pump.fun with an optional dev buy in the same
+ * transaction, signed by the wallet and the new mint, simulated first, then
+ * sent like any buy (Helius Sender or Jito). Returns { signature, tokensRaw }.
+ */
+async function launchToken({ mintKeypair, name, symbol, uri, devBuySol }) {
+  const { buildLaunchTx } = require('./pumpLaunch');
+  const { onlineSdkFor } = require('./pumpfunDirect');
+  const connection = getDirectConnection();
+  const sdk = onlineSdkFor(connection);
+  const feeSol = config.LAUNCH_PRIORITY_FEE_SOL;
+  const cu = config.LAUNCH_COMPUTE_UNITS;
+  const { tx, tokensRaw } = await buildLaunchTx({
+    connection,
+    user: walletPublicKey,
+    mint: mintKeypair.publicKey,
+    name,
+    symbol,
+    uri,
+    devBuySol,
+    mayhemMode: config.LAUNCH_MAYHEM_MODE,
+    tipSol: effectiveTip(config.JITO_TIP, 'buy'),
+    computeUnitLimit: cu,
+    priorityFeeMicroLamports: feeSol > 0 ? Math.ceil((feeSol * 1e9 * 1e6) / cu) : 0,
+    fetchGlobal: () => sdk.fetchGlobal(),
+    fetchFeeConfig: () => sdk.fetchFeeConfig()
+  });
+  // side 'launch': a Sender 429 is retried (the same signed transaction can only land once).
+  const signature = await signAndSendTx(tx, { feeSol, side: 'launch', extraSigners: [mintKeypair], simulate: true });
+  info(`[tradeExecutor] LAUNCH of ${symbol} (${mintKeypair.publicKey.toBase58()}) sent${devBuySol > 0 ? ` with a ${devBuySol} SOL dev buy` : ''}: https://solscan.io/tx/${signature}`);
+  return { signature, tokensRaw };
+}
+
 module.exports = {
+  launchToken,
   prewarmSell,
   priorityFeeSol,
   quoteTradeOf,
