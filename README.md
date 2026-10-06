@@ -6,8 +6,8 @@
 
 ![Node.js](https://img.shields.io/badge/node-%E2%89%A518.17-339933?logo=node.js&logoColor=white)
 ![Solana](https://img.shields.io/badge/Solana-mainnet-9945FF?logo=solana&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-180%20passing-2ea44f)
-![Version](https://img.shields.io/badge/version-3.35.1-blue)
+![Tests](https://img.shields.io/badge/tests-181%20passing-2ea44f)
+![Version](https://img.shields.io/badge/version-3.36.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Speed](#-built-for-speed) · [Rust fast path](#-rust-fast-path) · [Telegram](#-telegram-control) · [Full reference](docs/REFERENCE.md)
@@ -73,7 +73,7 @@ npm run check-env       # missing or misspelt settings (never prints values)
 npm run check-site -- <page> <coin address>   # does a coin's web page show its address? (safety filters + page check)
 npm run check-plain -- <coin address>   # simulate a buy with the cheaper token account (TOKEN_ACCOUNT_MODE=plain) vs the usual one
 npm run vps-bench       # how fast is this server for the bot? (CPU, and the round trip to Sender and your RPC)
-npm test                # 180 tests, fully simulated, no network or funds
+npm test                # 181 tests, fully simulated, no network or funds
 npm start
 ```
 

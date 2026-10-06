@@ -460,6 +460,13 @@ if (config.SEND_VIA === 'sender' && config.SENDER_TIP < senderMinTip) {
       `(Helius Sender's minimum; got ${config.SENDER_TIP}).`
   );
 }
+// Sender tip for SELLS, if different (default: SENDER_TIP). Sells rarely race
+// anyone, so a lower tip (Sender's minimum) saves SOL on every sell; or set it
+// higher to leave a falling coin faster.
+config.SELL_SENDER_TIP = numEnv('SELL_SENDER_TIP', { def: config.SENDER_TIP, min: 0 }); // SOL
+if (config.SEND_VIA === 'sender' && config.SELL_SENDER_TIP < senderMinTip) {
+  fail(`SELL_SENDER_TIP must be at least ${senderMinTip} SOL (Helius Sender's minimum; got ${config.SELL_SENDER_TIP}).`);
+}
 // Priority fee (SOL per transaction) on transactions the bot builds itself,
 // and the floor for SolanaPortal-built ones sent via Sender. Sender requires
 // one, so it defaults to 0.0001 SOL there; with Jito it defaults to none.
@@ -495,7 +502,7 @@ if (config.SEND_VIA === 'sender' && !(config.BUY_PRIORITY_FEE_SOL > 0)) {
 if (config.BUY_PRIORITY_FEE_SOL > 0.5) {
   console.warn(`[config] WARNING: BUY_PRIORITY_FEE_SOL=${config.BUY_PRIORITY_FEE_SOL} SOL per buy — that's very high (it is paid even when a buy is cancelled).`);
 }
-if (config.PRIORITY_FEE_SOL > 0.01 || config.SENDER_TIP > 0.05) {
+if (config.PRIORITY_FEE_SOL > 0.01 || config.SENDER_TIP > 0.05 || config.SELL_SENDER_TIP > 0.05) {
   console.warn(
     `[config] WARNING: PRIORITY_FEE_SOL=${config.PRIORITY_FEE_SOL} / SENDER_TIP=${config.SENDER_TIP} SOL per transaction — that's unusually high.`
   );

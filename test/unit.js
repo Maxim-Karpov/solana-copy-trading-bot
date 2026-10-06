@@ -3664,6 +3664,41 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(out.opts && out.opts.skipPreflight === true && out.opts.maxRetries === 0, `sent without preflight or RPC retries (${JSON.stringify(out.opts)})`);
   });
 
+  await test('SELL_SENDER_TIP: sells pay their own Sender tip (default: SENDER_TIP); buys are unchanged', async () => {
+    const script = `
+      const path = require('path');
+      const src = (f) => path.join(process.cwd(), 'src', f);
+      const { Keypair, SystemProgram, TransactionMessage, VersionedTransaction } = require('@solana/web3.js');
+      const bs58m = require('bs58'); const bs58 = bs58m.default || bs58m;
+      let sentTx = null;
+      globalThis.fetch = async (url, opts) => {
+        sentTx = VersionedTransaction.deserialize(Buffer.from(JSON.parse(opts.body).params[0], 'base64'));
+        return { ok: true, status: 200, statusText: 'OK', text: async () => JSON.stringify({ jsonrpc: '2.0', id: '1', result: bs58.encode(sentTx.signatures[0]) }) };
+      };
+      const { JITO_TIP_ACCOUNTS } = require(src('jitoTip.js'));
+      const payer = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
+      const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: '11111111111111111111111111111111',
+        instructions: [SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: JITO_TIP_ACCOUNTS[0], lamports: 5000 })] }).compileToV0Message();
+      const te = require(src('tradeExecutor.js'));
+      (async () => {
+        const out = {};
+        for (const side of ['buy', 'sell']) {
+          await te.signAndSendTx(new VersionedTransaction(msg), { feeSol: 0.0001, side });
+          const k = sentTx.message.staticAccountKeys.map(String);
+          const ix = sentTx.message.compiledInstructions.find((c) => k[c.programIdIndex] === '11111111111111111111111111111111');
+          out[side] = Number(Buffer.from(ix.data).readBigUInt64LE(4));
+        }
+        console.log(JSON.stringify(out));
+        process.exit(0);
+      })().catch((e) => { console.log(JSON.stringify({ error: e.message })); process.exit(0); });
+    `;
+    const run = (extra) => { const r = spawnSync(process.execPath, ['-e', script], { cwd: root, encoding: 'utf8', env: { ...process.env, SEND_VIA: 'sender', SENDER_TIP: '0.0016', ...extra } }); try { return JSON.parse((r.stdout || '').trim().split('\n').reverse().find((l) => l.startsWith('{'))); } catch { return { error: (r.stderr || r.stdout || '').slice(-300) }; } };
+    const own = run({ SELL_SENDER_TIP: '0.001' });
+    check(own.buy === 1600000 && own.sell === 1000000, `buy tips SENDER_TIP, sell tips SELL_SENDER_TIP (${JSON.stringify(own)})`);
+    const dflt = run({});
+    check(dflt.buy === 1600000 && dflt.sell === 1600000, `without SELL_SENDER_TIP sells tip SENDER_TIP as before (${JSON.stringify(dflt)})`);
+  });
+
   await test('on-chain errors: ProgramFailedToComplete explained as a likely compute shortfall', async () => {
     const { explainTxError } = require(src('txErrors.js'));
     const t = explainTxError({ InstructionError: [4, 'ProgramFailedToComplete'] }, 'pump-curve');

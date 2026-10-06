@@ -75,8 +75,13 @@ function priorityFeeSol(side, amountSol = 0) {
 }
 
 /** Tip to put on a transaction we build or request: Sender's when sending via Sender. */
-function effectiveTip(tip) {
-  return USE_SENDER ? config.SENDER_TIP : tip;
+function effectiveTip(tip, side = 'buy') {
+  return USE_SENDER ? senderTipFor(side) : tip;
+}
+
+/** Sender tip: SELL_SENDER_TIP for sells, SENDER_TIP otherwise. */
+function senderTipFor(side) {
+  return side === 'sell' ? config.SELL_SENDER_TIP : config.SENDER_TIP;
 }
 
 // Decode the private key and build the Keypair once at startup instead of on
@@ -112,7 +117,8 @@ class AmbiguousSendError extends Error {
  * Helius Sender when SEND_VIA="sender" and the transaction can be converted
  * for it, otherwise via Jito.
  */
-function prepareAndSign(tx, { feeSol = config.PRIORITY_FEE_SOL } = {}) {
+function prepareAndSign(tx, opts = {}) {
+  const { feeSol = config.PRIORITY_FEE_SOL } = opts;
   if (tx.handBuilt) {
     // Written for its route already (Sender's tip and fee, or Jito's).
     tx.sign(walletKeypair);
@@ -121,7 +127,7 @@ function prepareAndSign(tx, { feeSol = config.PRIORITY_FEE_SOL } = {}) {
   let viaSender = false;
   if (USE_SENDER) {
     const prep = prepareForSender(tx, {
-      tipLamports: config.SENDER_TIP * 1e9,
+      tipLamports: senderTipFor(opts.side) * 1e9,
       priorityFeeLamports: feeSol * 1e9
     });
     if (prep.ok) {
@@ -356,7 +362,7 @@ async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, t
       user: walletPublicKey,
       mint,
       slippagePct: slippage,
-      tipSol: effectiveTip(tip)
+      tipSol: effectiveTip(tip, side)
     };
     const cuLimit = label === 'Pump.fun' ? PUMPFUN_CU_LIMIT : RAYDIUM_CU_LIMIT;
     args.computeUnitLimit = cuLimit;
@@ -939,7 +945,7 @@ async function consolidatePlain(mint) {
       instructions: ixs,
       computeUnitLimit: 60_000,
       priorityFeeMicroLamports: priority > 0 ? Math.ceil((priority * 1e9 * 1e6) / 60_000) : 0,
-      tipSol: effectiveTip(config.JITO_TIP)
+      tipSol: effectiveTip(config.JITO_TIP, 'sell')
     });
     const sig = await signAndSendTx(tx, { feeSol: priority, side: 'sell' });
     for (let i = 0; i < 20; i++) {
@@ -958,7 +964,7 @@ async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool =
   const route = venue || dex;
   info(
     `[tradeExecutor] Placing SELL order: mint=${mint}, tokenAmount=${amountTokens}, ` +
-      `dex=${dex}, venue=${route}, slippage=${slippage}%, tip=${effectiveTip(tip)} SOL via ${USE_SENDER ? 'Helius Sender' : 'Jito'}`
+      `dex=${dex}, venue=${route}, slippage=${slippage}%, tip=${effectiveTip(tip, 'sell')} SOL via ${USE_SENDER ? 'Helius Sender' : 'Jito'}`
   );
 
   const t0 = Date.now();
@@ -968,7 +974,7 @@ async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool =
     const qt = directTx.tx.quoteTrade || null;
     let signature;
     try {
-      signature = await signAndSendTx(directTx.tx);
+      signature = await signAndSendTx(directTx.tx, { side: 'sell' });
     } catch (err) {
       if (err && err.txSignature) rememberQuoteTrade(err.txSignature, qt);
       if (err && err.txSignature) rememberCompute(err.txSignature, directTx.tx);
@@ -994,11 +1000,11 @@ async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool =
     amount: amountTokens,
     slippage,
     // Via Sender, the portal's Jito tip is redirected to Sender (and needs Sender's amount).
-    tip: effectiveTip(tip),
+    tip: effectiveTip(tip, 'sell'),
     type: 'jito'
   };
   return sendViaPortalOrJupiter('sell', params, () =>
-    buildJupiterSellTx({ user: walletPublicKey, mint, tokenAmountUi: amountTokens, slippagePct: slippage, tipSol: effectiveTip(tip) })
+    buildJupiterSellTx({ user: walletPublicKey, mint, tokenAmountUi: amountTokens, slippagePct: slippage, tipSol: effectiveTip(tip, 'sell') })
   );
 }
 
