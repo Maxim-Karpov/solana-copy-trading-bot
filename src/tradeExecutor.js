@@ -145,10 +145,12 @@ async function signAndSendTx(tx, opts = {}) {
   if (viaSender) {
     const raw = Buffer.from(tx.serialize());
     try {
-      return await sendViaSender(raw.toString('base64'), { hedge: () => sendViaRpcFallback(raw, txSignature) });
+      // A buy turned away with 429 isn't sent again unless BUY_RETRY_ON_SENDER_429: it would land late.
+      const retry = opts.side !== 'buy' || config.BUY_RETRY_ON_SENDER_429;
+      return await sendViaSender(raw.toString('base64'), { hedge: retry ? () => sendViaRpcFallback(raw, txSignature) : null, retry });
     } catch (err) {
       if (err.ambiguous) throw new AmbiguousSendError(err.message, txSignature);
-      if (err.rateLimited) return sendViaRpcFallback(raw, txSignature);
+      if (err.rateLimited && !err.noRetry) return sendViaRpcFallback(raw, txSignature);
       throw err;
     }
   }
@@ -408,7 +410,7 @@ async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, t
  */
 async function sendViaPortalOrJupiter(side, portalParams, buildJupiter) {
   const SIDE = side.toUpperCase();
-  const sendOpts = { feeSol: priorityFeeSol(side, portalParams && portalParams.amount) };
+  const sendOpts = { feeSol: priorityFeeSol(side, portalParams && portalParams.amount), side };
   const portalOn = config.USE_SOLANAPORTAL[side];
   const jupiterOn = config.JUPITER_FALLBACK[side];
   if (!portalOn) {
@@ -851,7 +853,7 @@ async function sendDirectBuy(directTx, { mint, amountSol, coinFilter, priceCheck
     const tSend = Date.now();
     let signature;
     try {
-      signature = await signAndSendTx(directTx.tx, { feeSol: priorityFeeSol('buy', amountSol) });
+      signature = await signAndSendTx(directTx.tx, { feeSol: priorityFeeSol('buy', amountSol), side: 'buy' });
     } catch (err) {
       if (guardInfo && err && err.txSignature) slotGuardMod.remember(err.txSignature, guardInfo);
       if (err && err.txSignature) rememberTiming(err.txSignature, { buildMs: builtMs, sendMs: Date.now() - tSend, sentAt: tSend });

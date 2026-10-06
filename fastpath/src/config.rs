@@ -22,6 +22,8 @@ pub struct Config {
     pub max_msgs_per_min: u64,
     pub use_sender: bool,
     pub sender_url: String,
+    /// BUY_RETRY_ON_SENDER_429: send a buy again after Sender's 429 (default off: it would land late).
+    pub retry_429: bool,
     pub jito_url: String,
     pub port: u16,
 }
@@ -139,6 +141,7 @@ pub fn load() -> Result<Config> {
         max_msgs_per_min,
         use_sender,
         sender_url,
+        retry_429: get("BUY_RETRY_ON_SENDER_429").as_deref() == Some("true"),
         jito_url,
         port,
     })

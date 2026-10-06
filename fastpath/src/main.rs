@@ -689,7 +689,8 @@ async fn main() {
     };
     log(&format!("Waiting for the Node bot on 127.0.0.1:{} (local only).", cfg.port));
 
-    let sender = send::Sender::new(cfg.use_sender, &cfg.sender_url, &cfg.jito_url, &cfg.rpc_url);
+    let mut sender = send::Sender::new(cfg.use_sender, &cfg.sender_url, &cfg.jito_url, &cfg.rpc_url);
+    sender.retry_429 = cfg.retry_429;
     sender.spawn_keepalive();
     // Buys from before a restart still count against the caps until saved.
     let mut local = state::Local::default();

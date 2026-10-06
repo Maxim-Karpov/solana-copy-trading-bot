@@ -436,6 +436,8 @@ if (!['jito', 'sender'].includes(config.SEND_VIA)) fail(`SEND_VIA must be "jito"
 config.SENDER_ENDPOINT = process.env.SENDER_ENDPOINT || 'http://fra-sender.helius-rpc.com/fast';
 if (!/^https?:\/\//.test(config.SENDER_ENDPOINT)) fail(`SENDER_ENDPOINT must be an http(s) URL (got "${config.SENDER_ENDPOINT}")`);
 config.SENDER_SWQOS_ONLY = process.env.SENDER_SWQOS_ONLY === 'true';
+// A BUY that Sender turns away with 429 is not sent again (it would land late); sells always are.
+config.BUY_RETRY_ON_SENDER_429 = process.env.BUY_RETRY_ON_SENDER_429 === 'true';
 config.SENDER_MEV_PROTECT = process.env.SENDER_MEV_PROTECT === 'true';
 const senderMinTip = config.SENDER_SWQOS_ONLY ? 0.000005 : 0.001;
 config.SENDER_TIP = numEnv('SENDER_TIP', { def: senderMinTip, min: 0 }); // SOL

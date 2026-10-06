@@ -210,7 +210,7 @@ let rateLimited = 0; // count, for the log
  * through the RPC) at once instead of after the retries; whichever sends
  * first wins (a transaction sent twice lands once).
  */
-async function sendViaSender(signedTxBase64, { hedge = null } = {}) {
+async function sendViaSender(signedTxBase64, { hedge = null, retry = true } = {}) {
   const body = {
     jsonrpc: '2.0',
     id: '1',
@@ -232,6 +232,12 @@ async function sendViaSender(signedTxBase64, { hedge = null } = {}) {
     }
     if (res.status !== 429 || attempt >= RATE_LIMIT_RETRY_MS.length) break;
     rateLimited += 1;
+    if (!retry) {
+      const e = new Error('Helius Sender refused it: 429 Too Many Requests (not sent again: BUY_RETRY_ON_SENDER_429 is off)');
+      e.rateLimited = true;
+      e.noRetry = true;
+      throw e;
+    }
     warn(`[Sender] Rate-limited by Helius Sender (429; ${rateLimited} this run); trying once more in ${RATE_LIMIT_RETRY_MS[attempt]}ms.`);
     if (hedge && attempt === 0) {
       const hedged = hedge();

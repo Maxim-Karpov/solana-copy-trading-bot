@@ -8,6 +8,8 @@ use std::time::Duration;
 pub struct Sender {
     client: reqwest::Client,
     pub use_sender: bool,
+    /// Send a buy again after Sender's 429 (off by default: it would land late).
+    pub retry_429: bool,
     sender_url: String,
     ping_url: String,
     jito_url: String,
@@ -73,7 +75,7 @@ impl Sender {
             }
             Err(_) => sender_url.into(),
         };
-        Sender { client, use_sender, sender_url: sender_url.into(), ping_url, jito_url: jito_url.into(), rpc_url: rpc_url.into() }
+        Sender { client, use_sender, retry_429: false, sender_url: sender_url.into(), ping_url, jito_url: jito_url.into(), rpc_url: rpc_url.into() }
     }
 
     /// Keep the connections a buy uses warm, so none starts with a TCP + TLS
@@ -140,6 +142,7 @@ impl Sender {
                 // Rate-limited: send it through the RPC at once AND try Sender again
                 // after a short pause; whichever accepts it first wins (the same signed
                 // transaction, so it can only land once).
+                Err(SenderTry::RateLimited) if !self.retry_429 => Err(SendError::Refused("Helius Sender rate-limited it (429); not sent again (BUY_RETRY_ON_SENDER_429 is off)".into())),
                 Err(SenderTry::RateLimited) => {
                     let rpc = json!({ "jsonrpc": "2.0", "id": 1, "method": "sendTransaction", "params": [b64, { "encoding": "base64", "skipPreflight": true, "maxRetries": 0 }] });
                     let again = async {

@@ -3475,12 +3475,17 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
       const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: '11111111111111111111111111111111',
         instructions: [SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: JITO_TIP_ACCOUNTS[0], lamports: 1000000 })] }).compileToV0Message();
       const { signAndSendTx } = require(src('tradeExecutor.js'));
-      signAndSendTx(new VersionedTransaction(msg), { feeSol: 0.0001 }).then((sig) => {
-        console.log(JSON.stringify({ sig, senderTries: senderBodies.length, sameTx: senderBodies.length && sentRaw.length && senderBodies[0] === sentRaw[0].raw, opts: sentRaw[0] && sentRaw[0].opts }));
+      signAndSendTx(new VersionedTransaction(msg), { feeSol: 0.0001, side: process.env.TEST_SIDE || undefined }).then((sig) => {
+        console.log(JSON.stringify({ sig, rpcSends: sentRaw.length, senderTries: senderBodies.length, sameTx: senderBodies.length && sentRaw.length && senderBodies[0] === sentRaw[0].raw, opts: sentRaw[0] && sentRaw[0].opts }));
         process.exit(0);
-      }).catch((e) => { console.log(JSON.stringify({ error: e.message })); process.exit(0); });
+      }).catch((e) => { console.log(JSON.stringify({ error: e.message, rpcSends: sentRaw.length, senderTries: senderBodies.length })); process.exit(0); });
     `;
-    const r = spawnSync(process.execPath, ['-e', script], { cwd: root, encoding: 'utf8', env: { ...process.env, SEND_VIA: 'sender' } });
+    const runCase = (extra) => { const rr = spawnSync(process.execPath, ['-e', script], { cwd: root, encoding: 'utf8', env: { ...process.env, SEND_VIA: 'sender', ...extra } }); try { return JSON.parse((rr.stdout || '').trim().split('\n').reverse().find((l) => l.startsWith('{'))); } catch { return null; } };
+    const buyOff = runCase({ TEST_SIDE: 'buy' });
+    check(buyOff && /not sent again/.test(buyOff.error || '') && buyOff.senderTries === 1 && buyOff.rpcSends === 0, `a BUY turned away with 429 is not sent again by default (${JSON.stringify(buyOff)})`);
+    const buyOn = runCase({ TEST_SIDE: 'buy', BUY_RETRY_ON_SENDER_429: 'true' });
+    check(buyOn && !buyOn.error && buyOn.rpcSends === 1, `BUY_RETRY_ON_SENDER_429=true sends it through the RPC (${JSON.stringify(buyOn)})`);
+    const r = spawnSync(process.execPath, ['-e', script], { cwd: root, encoding: 'utf8', env: { ...process.env, SEND_VIA: 'sender', TEST_SIDE: 'sell' } });
     const line = (r.stdout || '').trim().split('\n').reverse().find((l) => l.startsWith('{')) || '';
     let out = null;
     try { out = JSON.parse(line); } catch {}
