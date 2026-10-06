@@ -435,6 +435,13 @@ config.SEND_VIA = (process.env.SEND_VIA || 'jito').toLowerCase();
 if (!['jito', 'sender'].includes(config.SEND_VIA)) fail(`SEND_VIA must be "jito" or "sender" (got "${process.env.SEND_VIA}")`);
 config.SENDER_ENDPOINT = process.env.SENDER_ENDPOINT || 'http://fra-sender.helius-rpc.com/fast';
 if (!/^https?:\/\//.test(config.SENDER_ENDPOINT)) fail(`SENDER_ENDPOINT must be an http(s) URL (got "${config.SENDER_ENDPOINT}")`);
+if (config.SEND_VIA === 'sender' && !/[?&]api-key=/.test(config.SENDER_ENDPOINT)) {
+  console.warn(
+    '[config] WARNING: SENDER_ENDPOINT has no ?api-key=...: Helius Sender allows only 1 request per second per IP without a key (50 per second with one). ' +
+      'A sell sent within a second of a buy gets "429 Too Many Requests" (its tip is then paid for a send through your RPC). ' +
+      'Add your Helius API key: SENDER_ENDPOINT="http://fra-sender.helius-rpc.com/fast?api-key=YOUR_KEY".'
+  );
+}
 config.SENDER_SWQOS_ONLY = process.env.SENDER_SWQOS_ONLY === 'true';
 // A BUY that Sender turns away with 429 is not sent again (it would land late); sells always are.
 config.BUY_RETRY_ON_SENDER_429 = process.env.BUY_RETRY_ON_SENDER_429 === 'true';

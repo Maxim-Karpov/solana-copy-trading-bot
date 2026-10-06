@@ -858,3 +858,8 @@ Licensed under the MIT License. Based on [ahk780/solana-copy-trading-bot](https:
 - **Restart:** a position that was being sold in parts when the bot stopped has its rest sold at once on startup.
 - **Telegram** gets one message per sell as usual for the first part, then a single summary when the parts are done instead of one per slice; the PnL adds up all parts.
 - The position stays open (and counts toward `MAX_OPEN_POSITIONS`) until the last slice, about `DCA_SECONDS` after the buy.
+
+
+**Sender needs your API key in `SENDER_ENDPOINT`.** Helius Sender allows 1 request per second per IP without a key and 50 per second with one. A sell sent within a second of the buy (an instant sell, or DCA slices going out one after another through Sender) is then turned away with `429 Too Many Requests`; the bot sends the same signed transaction through your RPC instead, and its Sender tip is paid anyway. Use `SENDER_ENDPOINT="http://fra-sender.helius-rpc.com/fast?api-key=YOUR_KEY"` (the Rust fast path reads the same setting). The bot warns at startup when the key is missing.
+
+**Finding spam for `SHRED_EXCLUDE_ACCOUNTS` on the websocket feed.** With `DETECTION_FEED="transaction"` the `[Usage]` log has a line "websocket: N transaction(s) signed by others; busiest signers: ...; accounts in many of them (candidates for SHRED_EXCLUDE_ACCOUNTS...)". Those accounts appear in at least a quarter of the transactions that only mention a copy wallet and never in a transaction a copy wallet signed. Check one on Solscan before adding it.

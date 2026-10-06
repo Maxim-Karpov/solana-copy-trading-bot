@@ -15,8 +15,23 @@ const CREDITS_PER_CALL = 1;
 const CREDITS_PER_WS_MB = 20;
 
 function fresh() {
-  return { since: Date.now(), rpc: {}, rpcRefused: 0, wsMessages: 0, wsBytes: 0, wsSkipped: 0, wsNoise: 0, wsKinds: {}, wallets: {} };
+  return { since: Date.now(), rpc: {}, rpcRefused: 0, wsMessages: 0, wsBytes: 0, wsSkipped: 0, wsNoise: 0, wsKinds: {}, wallets: {}, others: { n: 0, signers: new Map(), accounts: new Map() } };
 }
+// Accounts every trade uses (never worth excluding), and accounts seen in a copy wallet's own transactions (never excluded).
+const COMMON = new Set([
+  '11111111111111111111111111111111',
+  'ComputeBudget111111111111111111111111111111',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'So11111111111111111111111111111111111111112',
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+  'SysvarRent111111111111111111111111111111111',
+  'SysvarC1ock11111111111111111111111111111111',
+  'Sysvar1nstructions1111111111111111111111111'
+]);
+const myAccounts = new Set();
 let period = fresh();
 let total = fresh();
 
@@ -34,6 +49,45 @@ function countWs(bytes) {
   period.wsBytes += bytes;
   total.wsBytes += bytes;
 }
+/**
+ * A transaction the websocket delivered: `keys` are its accounts, `signer` its fee payer, `mine` whether a copy
+ * wallet signed it. The ones others signed (spam) are tallied so the log can name accounts worth excluding.
+ */
+function noteTx(keys, signer, mine, walletSet = new Set()) {
+  if (mine) {
+    if (myAccounts.size < 20000) for (const k of keys) myAccounts.add(k);
+    return;
+  }
+  for (const s of [period, total]) {
+    const o = s.others;
+    o.n += 1;
+    if (signer && (o.signers.size < 5000 || o.signers.has(signer))) o.signers.set(signer, (o.signers.get(signer) || 0) + 1);
+    for (const k of new Set(keys)) {
+      if (walletSet.has(k) || k === signer) continue;
+      if (o.accounts.size < 20000 || o.accounts.has(k)) o.accounts.set(k, (o.accounts.get(k) || 0) + 1);
+    }
+  }
+}
+
+/** One line on who sends the transactions that merely mention a copy wallet, with exclusion candidates; '' if none. */
+function othersSummary(s) {
+  const o = s.others;
+  if (!o || !o.n) return '';
+  const top = (m, n) => [...m.entries()].sort((x, y) => y[1] - x[1]).slice(0, n);
+  const signers = top(o.signers, 3).map(([k, n]) => `${k} (${n})`).join(', ');
+  const exclude = top(o.accounts, 40)
+    .filter(([k, n]) => n >= Math.max(2, o.n * 0.25) && !myAccounts.has(k) && !COMMON.has(k))
+    .slice(0, 4)
+    .map(([k, n]) => `${k} (in ${Math.round((100 * n) / o.n)}%)`)
+    .join(', ');
+  return (
+    `${o.n} transaction(s) signed by others` +
+    (signers ? `; busiest signers: ${signers}` : '') +
+    (exclude ? `; accounts in many of them (candidates for SHRED_EXCLUDE_ACCOUNTS, check on Solscan first): ${exclude}` : '; no account stands out') +
+    '.'
+  );
+}
+
 function countSkipped() {
   period.wsSkipped += 1;
   total.wsSkipped += 1;
@@ -121,12 +175,16 @@ function logPeriod() {
   info(`[Usage] Last ${summary(period)}`);
   const w = walletSummary(period);
   if (w) info(`[Usage] Last ${Math.max(1, Math.round((Date.now() - period.since) / 60000))} min, ${w}`);
+  const o = othersSummary(period);
+  if (o) info(`[Usage] Last ${Math.max(1, Math.round((Date.now() - period.since) / 60000))} min, websocket: ${o}`);
   period = fresh();
 }
 function logTotal() {
   info(`[Usage] Whole run, ${summary(total)}`);
   const w = walletSummary(total);
   if (w) info(`[Usage] Whole run, ${w}`);
+  const o = othersSummary(total);
+  if (o) info(`[Usage] Whole run, websocket: ${o}`);
 }
 
 let timer = null;
@@ -140,4 +198,4 @@ function stop() {
   timer = null;
 }
 
-module.exports = { countWallet, walletSummary, countRpc, countRefused, countWs, countSkipped, countSkippedNoise, countWsKind, logPeriod, logTotal, start, stop, summary, _totals: () => total };
+module.exports = { noteTx, othersSummary, countWallet, walletSummary, countRpc, countRefused, countWs, countSkipped, countSkippedNoise, countWsKind, logPeriod, logTotal, start, stop, summary, _totals: () => total };

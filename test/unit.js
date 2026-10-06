@@ -1139,6 +1139,23 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(gap >= 700 && gap < 1000, `RPC_MAX_RPS=1.33: 750 ms apart (got ${gap})`);
   });
 
+  await test('usageStats: names the accounts behind spam (candidates for SHRED_EXCLUDE_ACCOUNTS)', async () => {
+    const u = require(src('usageStats.js'));
+    const wallet = Keypair.generate().publicKey.toBase58();
+    const spammer = Keypair.generate().publicKey.toBase58();
+    const spamProgram = Keypair.generate().publicKey.toBase58();
+    const mine = Keypair.generate().publicKey.toBase58();
+    const W = new Set([wallet]);
+    u.noteTx([wallet, mine, '11111111111111111111111111111111'], wallet, true, W);
+    for (let i = 0; i < 6; i++) u.noteTx([Keypair.generate().publicKey.toBase58(), wallet, spamProgram, '11111111111111111111111111111111'], null, false, W);
+    for (let i = 0; i < 2; i++) u.noteTx([spammer, wallet, spamProgram], spammer, false, W);
+    const line = u.othersSummary(u._totals());
+    check(/8 transaction\(s\) signed by others/.test(line), line);
+    check(line.includes(spamProgram) && /in 100%/.test(line), 'the account most spam shares is named');
+    check(!line.includes(wallet + ' (') && !line.includes('1111111111111111111111111111111 ('), 'the copy wallet and common programs are never suggested');
+    check(line.includes(spammer), 'the busiest signer is shown');
+  });
+
   await test('dcaSell: plans, slice sizes and timing', async () => {
     const d = require(src('dcaSell.js'));
     const cfg = require(src('config.js'));

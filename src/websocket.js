@@ -633,6 +633,14 @@ class CopyEmitter extends EventEmitter {
     // Only a copy wallet's own transactions can be its buys, sells or
     // transfers out; everything else mentioning it (spam) is dropped here.
     const signers = copySigners(parsedTx);
+    try {
+      const ks = (parsedTx.transaction && parsedTx.transaction.message && parsedTx.transaction.message.accountKeys) || [];
+      const names = ks.map((k) => String(k.pubkey && k.pubkey.toBase58 ? k.pubkey.toBase58() : k.pubkey));
+      const payer = ks.findIndex((k) => k && k.signer);
+      usageStats.noteTx(names, payer >= 0 ? names[payer] : null, signers.length > 0, COPY_WALLET_SET);
+    } catch {
+      // statistics only
+    }
     if (!signers.length) {
       usageStats.countSkippedNoise();
       count('others');
