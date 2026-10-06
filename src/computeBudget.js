@@ -35,6 +35,10 @@ const KEEP = 30; // recent trades remembered per kind
 // COMPUTE_MARGIN_UNITS (default 3000, a little more for small trades).
 const marginPct = () => (Number.isFinite(config.COMPUTE_MARGIN_PCT) ? config.COMPUTE_MARGIN_PCT : 10);
 const marginUnits = () => (Number.isFinite(config.COMPUTE_MARGIN_UNITS) ? config.COMPUTE_MARGIN_UNITS : 3000);
+// Sells can have their own margins (SELL_COMPUTE_MARGIN_PCT / SELL_COMPUTE_MARGIN_UNITS); unset = the same as buys.
+const isSell = (key) => typeof key === 'string' && key.startsWith('sell');
+const pctFor = (key) => (isSell(key) && Number.isFinite(config.SELL_COMPUTE_MARGIN_PCT) ? config.SELL_COMPUTE_MARGIN_PCT : marginPct());
+const unitsFor = (key) => (isSell(key) && Number.isFinite(config.SELL_COMPUTE_MARGIN_UNITS) ? config.SELL_COMPUTE_MARGIN_UNITS : marginUnits());
 const FLOOR = 20_000;
 
 let kinds = null; // key -> { used: number[] }
@@ -89,7 +93,7 @@ function estimate(key, ceiling) {
   const k = kinds.get(key);
   if (!k || k.used.length < MIN_SAMPLES) return null;
   const most = Math.max(...k.used);
-  return Math.max(FLOOR, Math.min(ceiling, Math.ceil(most * (1 + marginPct() / 100)) + marginUnits()));
+  return Math.max(FLOOR, Math.min(ceiling, Math.ceil(most * (1 + pctFor(key) / 100)) + unitsFor(key)));
 }
 
 /**

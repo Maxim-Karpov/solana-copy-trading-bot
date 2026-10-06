@@ -482,6 +482,9 @@ config.AUTO_COMPUTE_UNITS = (process.env.AUTO_COMPUTE_UNITS || '').trim() !== 'f
 // How far above the most a kind of trade has used its learned limit is set (see computeBudget.js).
 config.COMPUTE_MARGIN_PCT = numEnv('COMPUTE_MARGIN_PCT', { def: 10, min: 0, max: 100 });
 config.COMPUTE_MARGIN_UNITS = numEnv('COMPUTE_MARGIN_UNITS', { def: 3000, min: 0, max: 100_000, integer: true });
+// Sells' own margins; unset = the same as the buy margins above.
+config.SELL_COMPUTE_MARGIN_PCT = process.env.SELL_COMPUTE_MARGIN_PCT === undefined || process.env.SELL_COMPUTE_MARGIN_PCT === '' ? null : numEnv('SELL_COMPUTE_MARGIN_PCT', { def: 10, min: 0, max: 100 });
+config.SELL_COMPUTE_MARGIN_UNITS = process.env.SELL_COMPUTE_MARGIN_UNITS === undefined || process.env.SELL_COMPUTE_MARGIN_UNITS === '' ? null : numEnv('SELL_COMPUTE_MARGIN_UNITS', { def: 3000, min: 0, max: 100_000, integer: true });
 config.PRIORITY_FEE_SOL = numEnv('PRIORITY_FEE_SOL', { def: config.SEND_VIA === 'sender' ? 0.0001 : 0, min: 0 });
 if (config.SEND_VIA === 'sender' && !(config.PRIORITY_FEE_SOL > 0)) {
   fail('SEND_VIA="sender" requires PRIORITY_FEE_SOL greater than 0 (Helius Sender rejects transactions without a priority fee).');

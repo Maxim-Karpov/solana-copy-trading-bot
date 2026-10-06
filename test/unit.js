@@ -3792,6 +3792,22 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     cfg.COMPUTE_MARGIN_PCT = savedPct; cfg.COMPUTE_MARGIN_UNITS = savedUnits;
     const loose = cb.fit(make(16), 'buy', fee).limit;
     check(tight === Math.ceil(75140 * 1.01) + 300 && loose === Math.ceil(75140 * 1.1) + 3000 && tight < loose, `margin settings: tight ${tight}, default ${loose}`);
+    {
+      // Sells' own margins: buys keep the tight ones, sells get the roomier ones.
+      cb._resetForTests();
+      const sellKind = kind.replace(/^buy/, 'sell');
+      const mk = (k) => { const t = make(16); return t; };
+      ['q1', 'q2', 'q3'].forEach((sig) => { cb.remember(sig, kind, 300000); cb.observe(sig, 60000); });
+      ['r1', 'r2', 'r3'].forEach((sig) => { cb.remember(sig, sellKind, 300000); cb.observe(sig, 60000); });
+      cfg.COMPUTE_MARGIN_PCT = 3; cfg.COMPUTE_MARGIN_UNITS = 1000;
+      cfg.SELL_COMPUTE_MARGIN_PCT = 10; cfg.SELL_COMPUTE_MARGIN_UNITS = 3000;
+      const e = (k) => cb.estimate(k, 300000);
+      const b1 = e(kind), s1 = e(sellKind);
+      cfg.SELL_COMPUTE_MARGIN_PCT = null; cfg.SELL_COMPUTE_MARGIN_UNITS = null;
+      const s2 = e(sellKind);
+      cfg.COMPUTE_MARGIN_PCT = savedPct; cfg.COMPUTE_MARGIN_UNITS = savedUnits;
+      check(b1 === Math.ceil(60000 * 1.03) + 1000 && s1 === Math.ceil(60000 * 1.1) + 3000 && s2 === b1, `sell margins: buy ${b1}, sell ${s1}, sell unset ${s2}`);
+    }
     const saved = cfg.AUTO_COMPUTE_UNITS;
     cfg.AUTO_COMPUTE_UNITS = false;
     cb._resetForTests();
