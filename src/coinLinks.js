@@ -39,6 +39,35 @@ function parseUri(data) {
   }
 }
 
+/** Token-2022 coins keep their metadata inside the mint itself (TokenMetadata extension, type 19): its `uri`. */
+function parseMintUri(data) {
+  try {
+    if (data.length <= 166 || data[165] !== 1) return null; // not a Token-2022 mint with extensions
+    for (let at = 166; at + 4 <= data.length; ) {
+      const type = data.readUInt16LE(at);
+      const len = data.readUInt16LE(at + 2);
+      if (type === 19) {
+        const v = data.subarray(at + 4, at + 4 + len);
+        let o = 64; // update authority + mint
+        const str = () => {
+          const l = v.readUInt32LE(o);
+          if (l > 400) throw new Error('too long');
+          const t = v.subarray(o + 4, o + 4 + l).toString('utf8');
+          o += 4 + l;
+          return t;
+        };
+        str(); // name
+        str(); // symbol
+        return str().replace(/\0+$/, '').trim();
+      }
+      at += 4 + len;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function privateAddress(ip) {
   if (net.isIPv4(ip)) {
     const [a, b] = ip.split('.').map(Number);
@@ -85,23 +114,40 @@ function cleanLink(v) {
 /** { website, twitter, telegram } (each a string or null), or null if nothing could be read. */
 async function readLinks(mint, { fetchImpl = globalThis.fetch, lookup, getInfo } = {}) {
   const mintPk = new PublicKey(mint);
-  const info = await (getInfo ? getInfo(metadataPda(mintPk)) : require('./rpcPool').withFailover((c) => c.getAccountInfo(metadataPda(mintPk)), undefined, { priority: 'low' }));
-  if (!info) return null;
-  const uri = parseUri(Buffer.from(info.data));
-  if (!uri || !(await safeToFetch(uri, lookup))) return null;
+  const get = getInfo || ((pk) => require('./rpcPool').withFailover((c) => c.getAccountInfo(pk), undefined, { priority: 'low' }));
+  let uri = null;
+  const info = await get(metadataPda(mintPk));
+  if (info) uri = parseUri(Buffer.from(info.data));
+  if (!uri) {
+    // No Metaplex account: a Token-2022 coin carries its metadata in the mint itself.
+    const mintInfo = await get(mintPk);
+    if (mintInfo) uri = parseMintUri(Buffer.from(mintInfo.data));
+  }
+  if (!uri) return null;
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetchImpl(uri, { signal: ctl.signal, redirect: 'manual', headers: { accept: 'application/json' } });
-    if (!res.ok) return null;
-    const text = (await res.text()).slice(0, MAX_BYTES);
-    const j = JSON.parse(text);
-    const out = {
-      website: cleanLink(j.website) || cleanLink(j.external_url),
-      twitter: cleanLink(j.twitter) || cleanLink(j.extensions && j.extensions.twitter),
-      telegram: cleanLink(j.telegram) || cleanLink(j.extensions && j.extensions.telegram)
-    };
-    return out.website || out.twitter || out.telegram ? out : { website: null, twitter: null, telegram: null };
+    let url = uri;
+    for (let hop = 0; hop < 3; hop++) {
+      if (!(await safeToFetch(url, lookup))) return null; // checked again on every redirect
+      const res = await fetchImpl(url, { signal: ctl.signal, redirect: 'manual', headers: { accept: 'application/json' } });
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers && res.headers.get && res.headers.get('location');
+        if (!loc) return null;
+        url = new URL(loc, url).toString();
+        continue;
+      }
+      if (!res.ok) return null;
+      const text = (await res.text()).slice(0, MAX_BYTES);
+      const j = JSON.parse(text);
+      const out = {
+        website: cleanLink(j.website) || cleanLink(j.external_url),
+        twitter: cleanLink(j.twitter) || cleanLink(j.extensions && j.extensions.twitter),
+        telegram: cleanLink(j.telegram) || cleanLink(j.extensions && j.extensions.telegram)
+      };
+      return out.website || out.twitter || out.telegram ? out : { website: null, twitter: null, telegram: null };
+    }
+    return null;
   } catch {
     return null;
   } finally {
@@ -148,4 +194,4 @@ async function siteMentions(website, mint, { fetchImpl = globalThis.fetch, looku
   }
 }
 
-module.exports = { siteMentions, readLinks, parseUri, safeToFetch, unsafeReason, cleanLink, privateAddress };
+module.exports = { siteMentions, readLinks, parseUri, parseMintUri, safeToFetch, unsafeReason, cleanLink, privateAddress };

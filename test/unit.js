@@ -3289,6 +3289,23 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(fetched && fetched.redirect === 'manual', 'redirects not followed');
     check((await L.readLinks(mint, { getInfo: async () => meta('http://10.0.0.1/x'), lookup: pub, fetchImpl: async () => { throw new Error('must not fetch'); } })) === null, 'unsafe uri never fetched');
     check((await L.readLinks(mint, { getInfo: async () => null })) === null, 'no metadata account -> nothing');
+    {
+      // Token-2022 coin: metadata lives in the mint's TokenMetadata extension.
+      const str = (t) => { const b = Buffer.from(t); const l = Buffer.alloc(4); l.writeUInt32LE(b.length); return Buffer.concat([l, b]); };
+      const val = Buffer.concat([Buffer.alloc(64), str('Coin'), str('CN'), str('https://ipfs.io/ipfs/xyz'), Buffer.alloc(4)]);
+      const hdr = Buffer.alloc(4); hdr.writeUInt16LE(19, 0); hdr.writeUInt16LE(val.length, 2);
+      const mintData = Buffer.concat([Buffer.alloc(165), Buffer.from([1]), hdr, val]);
+      check(L.parseMintUri(mintData) === 'https://ipfs.io/ipfs/xyz', 'uri read from a Token-2022 mint');
+      let hops = 0;
+      const got2 = await L.readLinks(mint, {
+        getInfo: async (pk) => (String(pk) === mint ? { data: mintData } : null),
+        lookup: pub,
+        fetchImpl: async (u) => (hops++ === 0
+          ? { ok: false, status: 302, headers: { get: () => 'https://gw.example/ipfs/xyz' } }
+          : { ok: true, status: 200, text: async () => JSON.stringify({ website: 'https://t22.example' }) })
+      });
+      check(got2 && got2.website === 'https://t22.example', 'Token-2022 coin: links read from the mint, redirect followed');
+    }
     const ci = require(src('coinInfo.js'));
     const lines = ci.describe({ mcapUsd: null, mcapSol: null, curvePct: null, creatorPct: null, top10Pct: null, taxPct: null, links: got });
     check(lines.length === 1 && /unverified/.test(lines[0]) && /Web: https:\/\/coin\.example/.test(lines[0]) && /X: https:\/\/x\.com\/coin/.test(lines[0]), 'shown in the buy message, labelled unverified');

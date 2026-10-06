@@ -114,11 +114,12 @@ async function snapshot({ mint, pumpEvent = null, priceData = null }) {
   // Shown as soon as the metadata is read; the website check is added when it's done.
   const linksP = coinLinks.readLinks(mint).then((l) => {
     out.links = l;
+    if (!l) out.linksFailed = true;
     if (l && l.website) {
       return coinLinks.siteMentions(l.website, mint).then((r) => { l.siteMentions = r; }, () => {}).then(() => l);
     }
     return l;
-  }).catch(() => null);
+  }).catch(() => { out.linksFailed = true; return null; });
   linksP.catch(() => {});
   const work = (async () => {
     // Transfer tax: usually already looked up before the buy (cached).
@@ -200,6 +201,7 @@ function describe(snap) {
     const site = l.siteMentions === 'link' ? "the website link is this coin's own address page" : l.siteMentions === 'page' ? "✅ the website shows this coin's address" : l.siteMentions === false ? "❌ the website does NOT show this coin's address (scripted sites may still)" : l.website ? 'the website could not be checked (slow, blocked or unreadable)' : '🌐 no website filed';
     lines.push(found.length ? `Links (set by the creator, unverified):\n${found.join('\n')}${site ? `\n${site}` : ''}` : 'Links: none filed (no website, X or Telegram)');
   }
+  if (!snap.links && snap.linksFailed) lines.push('Links: could not be read (no website check)');
   if (snap.taxPct > 0) lines.push(`⚠️ Tax: ${fmtPct(snap.taxPct)} on every buy/sell (transfer fee)`);
   return lines;
 }
