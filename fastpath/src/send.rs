@@ -43,6 +43,11 @@ impl PostError {
     }
 }
 
+enum SenderTry {
+    RateLimited,
+    Failed(SendError),
+}
+
 pub enum SendError {
     /// Definitely not sent (refused).
     Refused(String),
@@ -110,34 +115,56 @@ impl Sender {
         Ok((status, v))
     }
 
+    /// One attempt at Sender.
+    async fn sender_once(&self, body: &Value) -> Result<String, SenderTry> {
+        let (status, v) = self.post(&self.sender_url, body).await.map_err(|e| SenderTry::Failed(e.into_send_error("Helius Sender")))?;
+        if status == 429 {
+            return Err(SenderTry::RateLimited);
+        }
+        if status >= 500 {
+            // A gateway error may come after Sender already forwarded it.
+            return Err(SenderTry::Failed(SendError::Ambiguous(format!("Helius Sender answered {status} {v}"))));
+        }
+        if !(200..300).contains(&status) {
+            return Err(SenderTry::Failed(SendError::Refused(format!("Helius Sender failed: {status} {v}"))));
+        }
+        v.get("result").and_then(|r| r.as_str()).map(String::from).ok_or_else(|| SenderTry::Failed(SendError::Ambiguous(format!("Helius Sender did not return a result: {v}"))))
+    }
+
     pub async fn send(&self, wire: &[u8], signature: &str) -> Result<String, SendError> {
         if self.use_sender {
             let b64 = base64::engine::general_purpose::STANDARD.encode(wire);
             let body = json!({ "jsonrpc": "2.0", "id": "1", "method": "sendTransaction", "params": [b64, { "encoding": "base64", "skipPreflight": true, "maxRetries": 0 }] });
-            for attempt in 0..2 {
-                let (status, v) = self.post(&self.sender_url, &body).await.map_err(|e| e.into_send_error("Helius Sender"))?;
-                if status == 429 {
-                    if attempt == 0 {
-                        tokio::time::sleep(Duration::from_millis(60)).await;
-                        continue;
-                    }
-                    // Rate-limited twice: the same signed transaction through the RPC.
+            let first = self.sender_once(&body).await;
+            match first {
+                // Rate-limited: send it through the RPC at once AND try Sender again
+                // after a short pause; whichever accepts it first wins (the same signed
+                // transaction, so it can only land once).
+                Err(SenderTry::RateLimited) => {
                     let rpc = json!({ "jsonrpc": "2.0", "id": 1, "method": "sendTransaction", "params": [b64, { "encoding": "base64", "skipPreflight": true, "maxRetries": 0 }] });
-                    return match self.post(&self.rpc_url, &rpc).await {
-                        Ok((_, v)) => v.get("result").and_then(|r| r.as_str()).map(String::from).ok_or_else(|| SendError::Ambiguous(format!("RPC send after Sender's 429: {v}"))),
-                        Err(e) => Err(e.into_send_error("the RPC (after Sender's 429)")),
+                    let again = async {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        match self.sender_once(&body).await {
+                            Ok(sig) => Ok(sig),
+                            Err(SenderTry::RateLimited) => Err(SendError::Ambiguous("Helius Sender rate-limited twice".into())),
+                            Err(SenderTry::Failed(e)) => Err(e),
+                        }
                     };
+                    let hedged = async {
+                        match self.post(&self.rpc_url, &rpc).await {
+                            Ok((_, v)) => v.get("result").and_then(|r| r.as_str()).map(String::from).ok_or_else(|| SendError::Ambiguous(format!("RPC send after Sender's 429: {v}"))),
+                            Err(e) => Err(e.into_send_error("the RPC (after Sender's 429)")),
+                        }
+                    };
+                    tokio::pin!(again, hedged);
+                    tokio::select! {
+                        r = &mut again => match r { Ok(sig) => Ok(sig), Err(e1) => hedged.await.map_err(|e2| match (e1, e2) { (SendError::Refused(a), SendError::Refused(b)) => SendError::Refused(format!("{a}; {b}")), (a, _) => a, }) },
+                        r = &mut hedged => match r { Ok(sig) => Ok(sig), Err(e2) => again.await.map_err(|e1| match (e1, e2) { (SendError::Refused(a), SendError::Refused(b)) => SendError::Refused(format!("{a}; {b}")), (a, _) => a, }) },
+                    }
                 }
-                if status >= 500 {
-                    // A gateway error may come after Sender already forwarded it.
-                    return Err(SendError::Ambiguous(format!("Helius Sender answered {status} {v}")));
-                }
-                if !(200..300).contains(&status) {
-                    return Err(SendError::Refused(format!("Helius Sender failed: {status} {v}")));
-                }
-                return v.get("result").and_then(|r| r.as_str()).map(String::from).ok_or_else(|| SendError::Ambiguous(format!("Helius Sender did not return a result: {v}")));
+                Err(SenderTry::Failed(e)) => Err(e),
+                Ok(sig) => Ok(sig),
             }
-            Err(SendError::Ambiguous("unreachable".into()))
         } else {
             // base64: much quicker to encode than base58, and Jito accepts it.
             let b64 = base64::engine::general_purpose::STANDARD.encode(wire);
