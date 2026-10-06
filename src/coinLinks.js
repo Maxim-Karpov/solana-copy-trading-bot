@@ -99,4 +99,40 @@ async function readLinks(mint, { fetchImpl = globalThis.fetch, lookup, getInfo }
   }
 }
 
-module.exports = { readLinks, parseUri, safeToFetch, cleanLink, privateAddress };
+const SITE_TIMEOUT_MS = 2000;
+const SITE_MAX_BYTES = 400_000;
+
+/**
+ * Does the coin's website show the coin's own address? true / false, or null if the
+ * page couldn't be read. The link may be to this very coin's address (a Pump.fun
+ * page): that counts as 'link'. A page built by scripts can show the address
+ * without it being in the HTML we fetch, so false is "not found", not "absent".
+ */
+async function siteMentions(website, mint, { fetchImpl = globalThis.fetch, lookup } = {}) {
+  if (website.includes(mint)) return 'link';
+  let url = website;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), SITE_TIMEOUT_MS);
+  try {
+    for (let hop = 0; hop < 3; hop++) {
+      if (!(await safeToFetch(url, lookup))) return null; // checked again on every redirect
+      const res = await fetchImpl(url, { signal: ctl.signal, redirect: 'manual', headers: { accept: 'text/html,*/*;q=0.5' } });
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers && res.headers.get && res.headers.get('location');
+        if (!loc) return null;
+        url = new URL(loc, url).toString();
+        continue;
+      }
+      if (!res.ok) return null;
+      const text = (await res.text()).slice(0, SITE_MAX_BYTES);
+      return text.includes(mint) ? 'page' : false;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+module.exports = { siteMentions, readLinks, parseUri, safeToFetch, cleanLink, privateAddress };

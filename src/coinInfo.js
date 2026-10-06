@@ -116,7 +116,14 @@ async function snapshot({ mint, pumpEvent = null, priceData = null }) {
     });
     const solUsdP = pumpEvent ? getSolUsd().catch(() => null) : Promise.resolve(null);
     // Transfer tax: usually already looked up before the buy (cached).
-    const linksP = coinLinks.readLinks(mint).catch(() => null);
+    // Shown as soon as the metadata is read; the website check is added when it's done.
+    const linksP = coinLinks.readLinks(mint).then((l) => {
+      out.links = l;
+      if (l && l.website) {
+        return coinLinks.siteMentions(l.website, mint).then((r) => { l.siteMentions = r; }, () => {}).then(() => l);
+      }
+      return l;
+    }).catch(() => null);
     const taxP = tokenTax.getTransferFeePct(mint, { priority: 'low' }).catch(() => null);
 
     // Market cap / curve from our own trade: ready at once (assuming the
@@ -140,7 +147,7 @@ async function snapshot({ mint, pumpEvent = null, priceData = null }) {
       applyCurve(holders.supplyRaw, solUsd);
     }
     out.taxPct = await taxP;
-    out.links = await linksP;
+    await linksP;
   })();
   work.catch(() => {}); // if it finishes after the timeout, nobody's listening
   try {
@@ -148,7 +155,7 @@ async function snapshot({ mint, pumpEvent = null, priceData = null }) {
   } catch (err) {
     warn(`[coinInfo] ${err.message} for ${mint}; sending what's ready.`);
   }
-  return { ...out }; // a copy: late results mustn't change what was already reported
+  return { ...out, links: out.links ? { ...out.links } : null }; // a copy: late results mustn't change what was already reported
 }
 
 function fmtUsd(v) {
@@ -180,7 +187,8 @@ function describe(snap) {
   if (snap.links) {
     const l = snap.links;
     const found = [l.website && `Web: ${l.website}`, l.twitter && `X: ${l.twitter}`, l.telegram && `TG: ${l.telegram}`].filter(Boolean);
-    lines.push(found.length ? `Links (set by the creator, unverified):\n${found.join('\n')}` : 'Links: none filed (no website, X or Telegram)');
+    const site = l.siteMentions === 'link' ? "the website link is this coin's own address page" : l.siteMentions === 'page' ? "the website shows this coin's address ✅" : l.siteMentions === false ? "the website does NOT show this coin's address (scripted sites may still)" : null;
+    lines.push(found.length ? `Links (set by the creator, unverified):\n${found.join('\n')}${site ? `\n${site}` : ''}` : 'Links: none filed (no website, X or Telegram)');
   }
   if (snap.taxPct > 0) lines.push(`⚠️ Tax: ${fmtPct(snap.taxPct)} on every buy/sell (transfer fee)`);
   return lines;

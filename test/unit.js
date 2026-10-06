@@ -3137,6 +3137,25 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(lines.length === 1 && /unverified/.test(lines[0]) && /Web: https:\/\/coin\.example/.test(lines[0]) && /X: https:\/\/x\.com\/coin/.test(lines[0]), 'shown in the buy message, labelled unverified');
   });
 
+  await test('coin website is checked for the coin\'s own address', async () => {
+    const L = require(src('coinLinks.js'));
+    const pub = async () => [{ address: '93.184.216.34' }];
+    const mint = Keypair.generate().publicKey.toBase58();
+    const page = (body, status = 200, headers = {}) => async () => ({ ok: status < 300, status, headers: { get: (k) => headers[k.toLowerCase()] }, text: async () => body });
+    check((await L.siteMentions('https://coin.example', mint, { lookup: pub, fetchImpl: page(`<p>CA: ${mint}</p>`) })) === 'page', 'address in the page -> page');
+    check((await L.siteMentions('https://coin.example', mint, { lookup: pub, fetchImpl: page('<p>moon</p>') })) === false, 'not in the page -> false');
+    check((await L.siteMentions(`https://pump.fun/coin/${mint}`, mint, { lookup: pub, fetchImpl: async () => { throw new Error('no fetch needed'); } })) === 'link', 'link that is the coin\'s own address page');
+    check((await L.siteMentions('https://coin.example', mint, { lookup: pub, fetchImpl: page('', 500) })) === null, 'error page -> unknown');
+    let calls = 0;
+    const hop = async (u) => { calls += 1; return { ok: false, status: 302, headers: { get: () => 'https://169.254.169.254/x' }, text: async () => '' }; };
+    check((await L.siteMentions('https://coin.example', mint, { lookup: async (h) => (h === '169.254.169.254' ? [{ address: '169.254.169.254' }] : pub()), fetchImpl: hop })) === null && calls === 1, 'a redirect to an internal address is not followed');
+    const ci = require(src('coinInfo.js'));
+    const base = { mcapUsd: null, mcapSol: null, curvePct: null, creatorPct: null, top10Pct: null, taxPct: null };
+    const yes = ci.describe({ ...base, links: { website: 'https://coin.example', twitter: null, telegram: null, siteMentions: 'page' } });
+    const no = ci.describe({ ...base, links: { website: 'https://coin.example', twitter: null, telegram: null, siteMentions: false } });
+    check(/shows this coin's address/.test(yes[0]) && /does NOT show/.test(no[0]), 'result shown in the buy message');
+  });
+
   await test('PumpSwap state is read in one round trip and equals the SDK\'s own three-step read', async () => {
     const sdk = require('@pump-fun/pump-swap-sdk');
     const spl = require('@solana/spl-token');
