@@ -72,6 +72,7 @@ struct Shared {
     seen: HashMap<String, (&'static str, Instant)>,
     seen_order: VecDeque<String>,
     known_programs: HashMap<Pubkey, Pubkey>, // mint -> token program, once seen
+    plain_used: HashSet<Pubkey>, // mints this program made a plain token account for (TOKEN_ACCOUNT_MODE=plain)
 }
 
 /// A buy report: complete, or built when needed (one saved just before the
@@ -350,7 +351,11 @@ impl App {
                 return decline(&why);
             }
         };
-        let kind = buy::kind_of(d.guard_max_slot.is_some(), &acc.token_program);
+        let plain = {
+            let s = self.shared.lock().unwrap();
+            buy::plain_plan(&template, &b.mint, &acc.token_program, &|m| s.plain_used.contains(m))
+        };
+        let kind = buy::kind_of(d.guard_max_slot.is_some(), &acc.token_program, plain.as_ref());
         let plan = buy::fee_plan(d.fee_sol, fees.ceiling, fees.use_sender, limits.get(&kind).copied());
         let input = buy::BuyInput {
             template: &template,
@@ -363,6 +368,7 @@ impl App {
             guard_max_slot: d.guard_max_slot,
             tip,
             blockhash,
+            plain: plain.as_ref(),
         };
         let built = match buy::build_buy(&input, &acc) {
             Ok(x) => x,
@@ -384,7 +390,7 @@ impl App {
             "readyMs": mark(t_signed),
             "guard": d.guard_max_slot.map(|m| json!({ "maxSlot": m, "ixIndex": built.guard_ix_index })),
             "compute": { "kind": kind, "limit": plan.limit, "learned": plan.learned, "feeSol": d.fee_sol },
-            "minOut": min_out.to_string(), "maxMcapSol": max_mcap, "tokenProgram": built.token_program.b58(),
+            "minOut": min_out.to_string(), "maxMcapSol": max_mcap, "tokenProgram": built.token_program.b58(), "plain": plain.is_some(),
         });
         if d.rehearse {
             let mut o = common;
@@ -407,6 +413,9 @@ impl App {
                 s.local.set_signature(id, &sig_b58);
             }
             s.known_programs.insert(b.mint, built.token_program);
+            if plain.is_some() {
+                s.plain_used.insert(b.mint);
+            }
         }
         let sent_at = state::now_ms();
         {
@@ -601,7 +610,8 @@ impl App {
             let f = &i["fees"];
             let acc = buy::coin_accounts(&mint, &present, &template.user, known_program).map_err(|e| anyhow::anyhow!(e))?;
             let guard = i["guardMaxSlot"].as_u64();
-            let kind = buy::kind_of(guard.is_some(), &acc.token_program);
+            let plain = buy::plain_plan(&template, &mint, &acc.token_program, &|_| false);
+            let kind = buy::kind_of(guard.is_some(), &acc.token_program, plain.as_ref());
             let plan = buy::fee_plan(f["feeSol"].as_f64().unwrap_or(0.0), f["ceiling"].as_u64().unwrap_or(0) as u32, f["useSender"].as_bool().unwrap_or(false), f["learnedLimit"].as_u64().map(|x| x as u32));
             let tip = if i["tip"].is_null() { None } else { Some((pk(&i["tip"]["account"])?, i["tip"]["lamports"].as_u64().unwrap_or(0))) };
             let input = buy::BuyInput {
@@ -615,6 +625,7 @@ impl App {
                 guard_max_slot: guard,
                 tip,
                 blockhash: pk(&i["blockhash"])?.0,
+                plain: plain.as_ref(),
             };
             let t0 = Instant::now();
             let built = buy::build_buy(&input, &acc)?;
@@ -716,6 +727,7 @@ async fn main() {
             seen: HashMap::new(),
             seen_order: VecDeque::new(),
             known_programs: HashMap::new(),
+            plain_used: HashSet::new(),
         }),
         sender,
         out: link.out,

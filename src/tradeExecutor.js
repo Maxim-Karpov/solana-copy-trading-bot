@@ -33,6 +33,7 @@ function quoteTradeOf(signature) {
 }
 const rpcPool = require('./rpcPool');
 const computeBudget = require('./computeBudget');
+const plainAccount = require('./plainAccount');
 const { info, warn } = require('./logger');
 const { withTimeout, fetchJson } = require('./timeouts');
 const pumpRoute = require('./pumpRoute');
@@ -730,8 +731,11 @@ async function compareWithRust(fastPath) {
     const ceiling = PUMPFUN_CU_LIMIT;
     const plan = handBuiltPlan(feeSol, ceiling, effectiveTip(config.JITO_TIP));
     const guardMaxSlot = guarded ? 987654321 : null;
-    const kind = `buy|${guarded ? 'L2TExM+' : ''}AToken+6EF8rr|${prog.equals(T22) ? 't22' : 'spl'}|a18`;
+    // The Rust path's plain accounts use its own seed (src/plainAccount.js).
+    const plainPlan = plainAccount.plan({ userBytes: walletPublicKey.toBuffer(), mint: mint.toBase58(), programBytes: prog.toBuffer(), builder: 'rust' });
+    const kind = pumpBuyRaw.kindOf(guarded ? [slotGuardMod.maxSlotInstruction(guardMaxSlot)] : [], prog.toBuffer(), plainPlan);
     const mine = pumpBuyRaw.buildBuy({
+      builder: 'rust',
       user: walletPublicKey,
       mint: mint.toBase58(),
       txKeys,
@@ -855,6 +859,7 @@ async function sendDirectBuy(directTx, { mint, amountSol, coinFilter, priceCheck
     try {
       signature = await signAndSendTx(directTx.tx, { feeSol: priorityFeeSol('buy', amountSol), side: 'buy' });
     } catch (err) {
+      if (err && err.txSignature && directTx.tx.plainMint) plainAccount.noteBuy(directTx.tx.plainMint); // may have gone out
       if (guardInfo && err && err.txSignature) slotGuardMod.remember(err.txSignature, guardInfo);
       if (err && err.txSignature) rememberTiming(err.txSignature, { buildMs: builtMs, sendMs: Date.now() - tSend, sentAt: tSend });
       if (err && err.txSignature) rememberQuoteTrade(err.txSignature, directTx.tx.quoteTrade);
@@ -862,6 +867,7 @@ async function sendDirectBuy(directTx, { mint, amountSol, coinFilter, priceCheck
       throw err;
     }
     onSent();
+    if (directTx.tx.plainMint) plainAccount.noteBuy(directTx.tx.plainMint); // its token account is a plain one: a later buy of this coin uses the ATA
     rememberCompute(signature, directTx.tx);
     if (guardInfo) slotGuardMod.remember(signature, guardInfo);
     rememberTiming(signature, { buildMs: builtMs, sendMs: Date.now() - tSend, sentAt: tSend });
@@ -894,6 +900,60 @@ function prewarmSell(mint) {
   }
 }
 
+/**
+ * TOKEN_ACCOUNT_MODE=plain: the routes the bot doesn't build itself (SolanaPortal,
+ * Jupiter) sell from the ATA, so tokens in a plain account are moved there
+ * first, in a transaction of their own that is waited for. Nothing happens
+ * (and nothing is read) unless the bot has ever used plain accounts.
+ */
+async function consolidatePlain(mint) {
+  if (!plainAccount.everUsed()) return;
+  try {
+    const { PublicKey: PK } = require('@solana/web3.js');
+    const spl = require('@solana/spl-token');
+    const connection = getDirectConnection();
+    const mintPk = new PK(mint);
+    const lists = [spl.TOKEN_PROGRAM_ID, spl.TOKEN_2022_PROGRAM_ID].map((program) => ({ program, list: plainAccount.holders(walletPublicKey, mint, program) }));
+    const infos = await connection.getMultipleAccountsInfo([mintPk, ...lists.flatMap((l) => l.list.map((h) => h.address))]);
+    const mintInfo = infos[0];
+    if (!mintInfo) return;
+    const idx = mintInfo.owner.equals(spl.TOKEN_2022_PROGRAM_ID) ? 1 : 0;
+    const { program, list } = lists[idx];
+    const mine = infos.slice(1 + idx * 3, 4 + idx * 3);
+    const moves = [];
+    list.forEach((h, i) => {
+      const raw = plainAccount.amountOf(mine[i]);
+      if (h.kind === 'plain' && raw && raw > 0n) moves.push({ address: h.address, raw });
+    });
+    if (!moves.length) return;
+    const decimals = mintInfo.data.length >= 45 ? Buffer.from(mintInfo.data).readUInt8(44) : 6;
+    const ixs = [];
+    if (!mine[0]) ixs.push(plainAccount.createAtaInstruction(walletPublicKey, mint, program));
+    ixs.push(...plainAccount.moveInstructions({ user: walletPublicKey, mint, program, decimals, to: list[0].address, moves }));
+    info(`[tradeExecutor] ${mint} is in a plain token account; moving it to the usual one before selling another way.`);
+    const { assembleV0Tx } = require('./txAssemble');
+    const priority = priorityFeeSol('sell', 0);
+    const tx = await assembleV0Tx({
+      connection,
+      payer: walletPublicKey,
+      instructions: ixs,
+      computeUnitLimit: 60_000,
+      priorityFeeMicroLamports: priority > 0 ? Math.ceil((priority * 1e9 * 1e6) / 60_000) : 0,
+      tipSol: effectiveTip(config.JITO_TIP)
+    });
+    const sig = await signAndSendTx(tx, { feeSol: priority, side: 'sell' });
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const st = (await connection.getSignatureStatuses([sig])).value[0];
+      if (st && st.err) throw new Error(`the move failed on-chain (${JSON.stringify(st.err)})`);
+      if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) return;
+    }
+    warn(`[tradeExecutor] The move of ${mint} to its usual token account wasn't confirmed in 10s; selling anyway.`);
+  } catch (err) {
+    warn(`[tradeExecutor] Couldn't move ${mint} out of its plain token account (${err.message}); selling anyway.`);
+  }
+}
+
 async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool = null, warm = false }) {
   const route = venue || dex;
   info(
@@ -922,6 +982,9 @@ async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool =
     );
     return signature;
   }
+
+  // Sold another way (SolanaPortal / Jupiter): from the usual token account.
+  await consolidatePlain(mint);
 
   const params = {
     wallet_address: config.PUBLIC_KEY,

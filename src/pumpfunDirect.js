@@ -39,6 +39,7 @@ const { info } = require('./logger');
 const quoteTokens = require('./quoteTokens');
 const config = require('./config');
 const pumpBuyRaw = require('./pumpBuyRaw');
+const plainAccount = require('./plainAccount');
 
 class UnsupportedPumpfunTradeError extends Error {}
 
@@ -139,20 +140,26 @@ async function curveState(connection, mintPk, user) {
   let curveAcc;
   let userAcc;
   let mintInfo = known;
+  let holders = null; // TOKEN_ACCOUNT_MODE=plain: where the tokens may be (the ATA and plain accounts), in the same read
+  const withPlain = plainAccount.everUsed();
   if (known) {
-    [curveAcc, userAcc] = await connection.getMultipleAccountsInfo([curvePk, getAssociatedTokenAddressSync(mintPk, user, true, known.program)]);
+    const list = withPlain ? plainAccount.holders(user, key, known.program) : [{ address: getAssociatedTokenAddressSync(mintPk, user, true, known.program), kind: 'ata' }];
+    const infos = await connection.getMultipleAccountsInfo([curvePk, ...list.map((h) => h.address)]);
+    curveAcc = infos[0];
+    userAcc = infos[1];
+    if (withPlain) holders = { list, infos: infos.slice(1) };
   } else {
-    let mintAcc;
-    let ataClassic;
-    let ata2022;
-    [curveAcc, mintAcc, ataClassic, ata2022] = await connection.getMultipleAccountsInfo([
-      curvePk,
-      mintPk,
-      getAssociatedTokenAddressSync(mintPk, user, true, TOKEN_PROGRAM_ID),
-      getAssociatedTokenAddressSync(mintPk, user, true, TOKEN_2022_PROGRAM_ID)
-    ]);
-    mintInfo = parseMint(mintAcc, key);
-    userAcc = mintInfo.program.equals(TOKEN_2022_PROGRAM_ID) ? ata2022 : ataClassic;
+    const classicList = withPlain ? plainAccount.holders(user, key, TOKEN_PROGRAM_ID) : [{ address: getAssociatedTokenAddressSync(mintPk, user, true, TOKEN_PROGRAM_ID), kind: 'ata' }];
+    const t22List = withPlain ? plainAccount.holders(user, key, TOKEN_2022_PROGRAM_ID) : [{ address: getAssociatedTokenAddressSync(mintPk, user, true, TOKEN_2022_PROGRAM_ID), kind: 'ata' }];
+    const infos = await connection.getMultipleAccountsInfo([curvePk, mintPk, ...classicList.map((h) => h.address), ...t22List.map((h) => h.address)]);
+    curveAcc = infos[0];
+    mintInfo = parseMint(infos[1], key);
+    const n = classicList.length;
+    const classicInfos = infos.slice(2, 2 + n);
+    const t22Infos = infos.slice(2 + n);
+    const is22 = mintInfo.program.equals(TOKEN_2022_PROGRAM_ID);
+    userAcc = (is22 ? t22Infos : classicInfos)[0];
+    if (withPlain) holders = { list: is22 ? t22List : classicList, infos: is22 ? t22Infos : classicInfos };
   }
   if (!curveAcc) throw new Error(`Bonding curve account not found for mint: ${key}`);
   const bondingCurve = PUMP_SDK.decodeBondingCurve(curveAcc);
@@ -171,6 +178,7 @@ async function curveState(connection, mintPk, user) {
     bondingCurveAccountInfo: curveAcc,
     bondingCurve,
     associatedUserAccountInfo: userAcc || null,
+    holders,
     quoteMint: sol ? NATIVE_MINT : bondingCurve.quoteMint,
     quoteTokenProgram
   };
@@ -408,10 +416,17 @@ async function buildFastBuy({ connection, user, mintPk, solAmount, fastHint, max
   BUY_EXACT_SOL_IN.copy(data, 0);
   data.writeBigUInt64LE(lamports, 8); // spendable_sol_in
   data.writeBigUInt64LE(minOut, 16); // min_tokens_out
-  const keys = buyIx.keys.map((k, i) => (i === 9 ? { ...k, pubkey: new PublicKey(fastHint.creatorVault) } : k));
+  // TOKEN_ACCOUNT_MODE=plain: the token account is made directly instead of by the ATA program.
+  const plain = plainAccount.plan({ userBytes: user.toBuffer(), mint: fastHint.mint, programBytes: tokenProgram.toBuffer() });
+  const keys = buyIx.keys.map((k, i) => {
+    if (i === 9) return { ...k, pubkey: new PublicKey(fastHint.creatorVault) };
+    if (i === 5 && plain) return { ...k, pubkey: new PublicKey(plain.address) };
+    return k;
+  });
   const fastIx = new TransactionInstruction({ programId: buyIx.programId, keys, data });
 
-  const tx = await assembleV0Tx({ connection, payer: user, instructions: [ataIx, fastIx], computeUnitLimit, priorityFeeMicroLamports, tipSol, guardInstructions });
+  const tx = await assembleV0Tx({ connection, payer: user, instructions: [...(plain ? plainAccount.toWeb3(plain.ixs) : [ataIx]), fastIx], computeUnitLimit, priorityFeeMicroLamports, tipSol, guardInstructions });
+  if (plain) Object.defineProperty(tx, 'plainMint', { value: fastHint.mint, enumerable: false });
   const creatorBlocked = blockedVaultsOf(blockedCreators).has(fastHint.creatorVault);
   attachCoin(tx, { capOnChain: true, creatorBlocked });
   tx.builtFrom = `no lookup (SHRED_FAST_BUY: exact ${solAmount} SOL, at least ${(Number(minOut) / 1e6).toFixed(0)} tokens = market cap ${maxMcapSol} SOL)`;
@@ -615,6 +630,37 @@ async function buildPumpfunBuyTx({
 }
 
 /**
+ * Point a sell at the account the tokens are in. The SDK builds it for the
+ * ATA; if they are in a plain account (TOKEN_ACCOUNT_MODE=plain) its address
+ * replaces the ATA's, and tokens in a second account are moved over first.
+ * Returns the instructions to send (unchanged when everything is in the ATA).
+ */
+function placeSellAccount({ instructions, st, user, mint, tokenProgram, decimals }) {
+  if (!st.holders) return instructions;
+  const { list, infos } = st.holders;
+  const ata = list[0].address;
+  const src = plainAccount.sellSource(list, infos);
+  let from = src.from;
+  if (!src.found) {
+    // Read before the buy landed (a warm sell state): where the bot's own buy put them.
+    const guessed = plainAccount.guess(user, mint, tokenProgram);
+    if (guessed) from = guessed;
+  }
+  const pre = [];
+  if (src.move.length) pre.push(...plainAccount.moveInstructions({ user, mint, program: tokenProgram, decimals, to: from, moves: src.move }));
+  if (from.equals(ata)) return [...pre, ...instructions];
+  const swapped = instructions.map(
+    (ix) =>
+      new TransactionInstruction({
+        programId: ix.programId,
+        keys: ix.keys.map((k) => (k.pubkey.equals(ata) ? { ...k, pubkey: from } : k)),
+        data: ix.data
+      })
+  );
+  return [...pre, ...swapped];
+}
+
+/**
  * Build an unsigned sell transaction.
  * @param tokenAmountUi - tokens to sell, in UI units (e.g. "1234.56")
  * @param slippagePct   - percent, e.g. 20 for 20%
@@ -674,7 +720,9 @@ async function buildPumpfunSellTx({
     cashback: bondingCurve.isCashbackCoin || false
   });
 
-  const sellTx = await assembleV0Tx({ connection, payer: user, instructions, computeUnitLimit, priorityFeeMicroLamports, tipSol });
+  // TOKEN_ACCOUNT_MODE=plain: the tokens may be in a plain account (or split over two): sell from where they are.
+  const placed = placeSellAccount({ instructions, st, user, mint, tokenProgram, decimals: mintInfo.decimals });
+  const sellTx = await assembleV0Tx({ connection, payer: user, instructions: placed, computeUnitLimit, priorityFeeMicroLamports, tipSol });
   if (warmed) sellTx.builtFrom = 'from the coin state read when the buy went out, no lookup';
   return sellTx;
 }
@@ -874,4 +922,4 @@ async function prepareHandBuilt(user) {
   }
 }
 
-module.exports = { worstFeeBpsFor: worstFeeBps, prepareHandBuilt, recipientsOf, buildQuoteBuy, quoteBudget, minTokensAtMcap, buildPumpfunBuyTx, buildPumpfunSellTx, prewarmSell, UnsupportedPumpfunTradeError, mintTokenProgram, mintDetails, warmFeeConfig, warmUpBuild, onlineSdkFor, curveState, stateFromHint, _resetForTests };
+module.exports = { worstFeeBpsFor: worstFeeBps, prepareHandBuilt, recipientsOf, buildQuoteBuy, quoteBudget, minTokensAtMcap, buildPumpfunBuyTx, buildPumpfunSellTx, placeSellAccount, prewarmSell, UnsupportedPumpfunTradeError, mintTokenProgram, mintDetails, warmFeeConfig, warmUpBuild, onlineSdkFor, curveState, stateFromHint, _resetForTests };

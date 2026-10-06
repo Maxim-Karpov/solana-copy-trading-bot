@@ -23,6 +23,7 @@ const { OnlinePumpAmmSdk, PUMP_AMM_SDK, canonicalPumpPoolPda, buyQuoteInput, GLO
 const { assembleV0Tx } = require('./txAssemble');
 const { uiToRaw } = require('./amounts');
 const { attachQuote, attachCoin } = require('./buyQuote');
+const plainAccount = require('./plainAccount');
 
 class UnsupportedPumpSwapTradeError extends Error {}
 
@@ -173,11 +174,34 @@ async function buildPumpSwapBuyTx({ connection, user, mint, solAmount, slippageP
 }
 
 /** Unsigned sell: sell `tokenAmountUi` of `mint` for SOL in its PumpSwap pool. */
+/** Instructions that move a coin's tokens from plain accounts into the ATA (none if there are none). */
+async function plainPrelude(connection, user, mint, state) {
+  const program = state.baseTokenProgram;
+  if (!program) return [];
+  const list = plainAccount.holders(user, mint, program);
+  const infos = await connection.getMultipleAccountsInfo(list.map((h) => h.address));
+  const moves = [];
+  list.forEach((h, i) => {
+    const raw = plainAccount.amountOf(infos[i]);
+    if (h.kind === 'plain' && raw && raw > 0n) moves.push({ address: h.address, raw });
+  });
+  if (!moves.length) return [];
+  const pre = [];
+  if (!infos[0]) pre.push(plainAccount.createAtaInstruction(user, mint, program));
+  pre.push(...plainAccount.moveInstructions({ user, mint, program, decimals: state.baseMintAccount.decimals, to: list[0].address, moves }));
+  return pre;
+}
+
 async function buildPumpSwapSellTx({ connection, user, mint, tokenAmountUi, slippagePct, tipSol = 0, computeUnitLimit = 300_000, priorityFeeMicroLamports = 0 }) {
   const state = await poolState(connection, user, mint);
   const raw = uiToRaw(tokenAmountUi, state.baseMintAccount.decimals);
   if (raw <= 0n) throw new UnsupportedPumpSwapTradeError(`sell amount for ${mint} rounds to zero`);
-  const instructions = await PUMP_AMM_SDK.sellBaseInput(state, new BN(raw.toString()), slippagePct);
+  let instructions = await PUMP_AMM_SDK.sellBaseInput(state, new BN(raw.toString()), slippagePct);
+  // TOKEN_ACCOUNT_MODE=plain: tokens bought into a plain account are moved into the ATA first (the pool sells from there).
+  if (plainAccount.everUsed()) {
+    const pre = await plainPrelude(connection, user, mint, state);
+    if (pre.length) instructions = [...pre, ...instructions];
+  }
   return labelled(await assembleV0Tx({ connection, payer: user, instructions, computeUnitLimit, priorityFeeMicroLamports, tipSol }));
 }
 

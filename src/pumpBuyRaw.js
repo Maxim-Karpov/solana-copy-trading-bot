@@ -23,6 +23,7 @@ const bs58Mod = require('bs58');
 const bs58 = bs58Mod.default || bs58Mod;
 const { keyFor } = require('./fastSign');
 const computeBudget = require('./computeBudget');
+const plainAccount = require('./plainAccount');
 
 const PUMP = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P').toBuffer();
 const ATA_PROGRAM = ASSOCIATED_TOKEN_PROGRAM_ID.toBuffer();
@@ -328,6 +329,7 @@ const u64 = (n) => {
  */
 function buildBuy({
   user, // PublicKey (the template's)
+  builder = 'node', // whose plain-account seed (the Rust path's practice build is compared with 'rust')
   mint, // base58
   txKeys, // his transaction's keys (base58)
   knownTokenProgram = null, // Buffer, when the coin was seen before
@@ -354,7 +356,9 @@ function buildBuy({
   set('mint', mintB);
   set('bondingCurve', acc.curve);
   set('associatedBondingCurve', acc.abc);
-  set('associatedUser', acc.associatedUser);
+  // TOKEN_ACCOUNT_MODE=plain: the buyer's token account is made directly (no ATA program).
+  const plain = plainAccount.plan({ userBytes: userB, mint, programBytes: acc.tokenProgram, builder });
+  set('associatedUser', plain ? plain.address : acc.associatedUser);
   set('tokenProgram', acc.tokenProgram);
   set('creatorVault', keyBytes(creatorVault));
   set('bondingCurveV2', acc.curveV2);
@@ -364,7 +368,7 @@ function buildBuy({
   data.writeBigUInt64LE(minOut, 16);
   data[24] = template.trackVolume;
 
-  const plan = feePlan(fees, kindOf(guardInstructions, acc.tokenProgram));
+  const plan = feePlan(fees, kindOf(guardInstructions, acc.tokenProgram, plain));
   const { computeLimit, priceMicroLamports, priceFirst } = plan;
   const budget = [{ program: COMPUTE_BUDGET, keys: [], data: Buffer.concat([Buffer.from([2]), u32(computeLimit)]) }];
   if (priceMicroLamports !== null) {
@@ -377,18 +381,20 @@ function buildBuy({
   for (const g of guardInstructions) {
     ixs.push({ program: g.programId.toBuffer(), keys: g.keys.map((k) => ({ key: k.pubkey.toBuffer(), isSigner: k.isSigner, isWritable: k.isWritable })), data: Buffer.from(g.data) });
   }
-  ixs.push({
-    program: ATA_PROGRAM,
-    keys: [
-      { key: userB, isSigner: true, isWritable: true },
-      { key: acc.associatedUser, isSigner: false, isWritable: true },
-      { key: userB, isSigner: false, isWritable: false },
-      { key: mintB, isSigner: false, isWritable: false },
-      { key: SYSTEM, isSigner: false, isWritable: false },
-      { key: acc.tokenProgram, isSigner: false, isWritable: false }
-    ],
-    data: Buffer.from([1]) // create idempotent
-  });
+  if (plain) ixs.push(...plain.ixs);
+  else
+    ixs.push({
+      program: ATA_PROGRAM,
+      keys: [
+        { key: userB, isSigner: true, isWritable: true },
+        { key: acc.associatedUser, isSigner: false, isWritable: true },
+        { key: userB, isSigner: false, isWritable: false },
+        { key: mintB, isSigner: false, isWritable: false },
+        { key: SYSTEM, isSigner: false, isWritable: false },
+        { key: acc.tokenProgram, isSigner: false, isWritable: false }
+      ],
+      data: Buffer.from([1]) // create idempotent
+    });
   ixs.push({ program: PUMP, keys, data });
   if (tip && tip.lamports > 0) {
     ixs.push({
@@ -403,13 +409,15 @@ function buildBuy({
   const message = compileV0(userB, ixs, keyBytes(blockhash));
   const tx = new HandBuiltTx(message, { guardIxIndex });
   tx.compute = { kind: plan.kind, limit: computeLimit, learned: plan.learned, feeSol: fees.feeSol };
+  if (plain) Object.defineProperty(tx, 'plainMint', { value: mint, enumerable: false });
   return { tx, tokenProgram: acc.tokenProgram.equals(TOKEN_2022) ? 'token-2022' : 'spl-token' };
 }
 
 /** computeBudget.kindOf's key for this buy (so learned limits are shared with the SDK route). */
-function kindOf(guardInstructions, tokenProgram) {
+function kindOf(guardInstructions, tokenProgram, plain = null) {
   const programs = guardInstructions.map((g) => g.programId.toBase58().slice(0, 6));
-  programs.push('AToken', '6EF8rr');
+  if (plain) programs.push(...plain.kindPrograms, '6EF8rr');
+  else programs.push('AToken', '6EF8rr');
   return `buy|${programs.join('+')}|${tokenProgram.equals(TOKEN_2022) ? 't22' : 'spl'}|a${BUY_ACCOUNTS}`;
 }
 
@@ -459,4 +467,5 @@ function _resetForTests() {
   disabled = null;
 }
 
-module.exports = { getTemplate, buildBuy, setTemplate, ready, disable, status, compileV0, HandBuiltTx, keySetOf, coinAccounts, derive, isOnCurve, ROLE, _resetForTests };
+module.exports = {
+  kindOf, getTemplate, buildBuy, setTemplate, ready, disable, status, compileV0, HandBuiltTx, keySetOf, coinAccounts, derive, isOnCurve, ROLE, _resetForTests };

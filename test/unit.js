@@ -1472,8 +1472,8 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(diff === 0, `same addresses as findProgramAddressSync (${diff} differ)`);
   });
 
-  for (const via of ['sender', 'jito']) {
-    await test(`hand-built buys (${via}): byte-identical to the SDK route, sent through buyToken, switched off if the layout changes`, async () => {
+  for (const [via, plain] of [['sender', false], ['jito', false], ['sender', true]]) {
+    await test(`hand-built buys (${via}${plain ? ', TOKEN_ACCOUNT_MODE=plain' : ''}): byte-identical to the SDK route, sent through buyToken, switched off if the layout changes`, async () => {
       const script = `
         Math.random = () => 0; // the same random picks on both routes
         const BN = require('bn.js');
@@ -1506,6 +1506,9 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
         const slotGuard = require('./src/slotGuard');
         const config = require('./src/config');
         const user = new PublicKey(config.PUBLIC_KEY);
+        const plainMode = ${plain};
+        const plainAccount = require('./src/plainAccount');
+        if (plainMode) plainAccount._setT22Len(170);
         const vault = sdk.creatorVaultPda(Keypair.generate().publicKey).toBase58();
         const hintFor = (mint, prog) => { const curve = sdk.bondingCurvePda(mint); return { mint: mint.toBase58(), creatorVault: vault,
           txKeys: [curve, getAssociatedTokenAddressSync(mint, curve, true, prog), sdk.bondingCurveV2Pda(mint), feeRecipient].map(String) }; };
@@ -1521,7 +1524,7 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
             const mint = Keypair.generate().publicKey;
             const guardInstructions = guarded ? [slotGuard.maxSlotInstruction(777000)] : [];
             if (learned) {
-              const kind = 'buy|' + (guarded ? 'L2TExM+' : '') + 'AToken+6EF8rr|' + (prog.equals(TOKEN_2022_PROGRAM_ID) ? 't22' : 'spl') + '|a18';
+              const kind = 'buy|' + (guarded ? 'L2TExM+' : '') + (plainMode ? (prog.equals(TOKEN_2022_PROGRAM_ID) ? 'Tokenz+Tokenz' : 'Tokenk') : 'AToken') + '+6EF8rr|' + (prog.equals(TOKEN_2022_PROGRAM_ID) ? 't22' : 'spl') + '|a18';
               for (let i = 0; i < 3; i++) { computeBudget.remember('s' + i + kind, kind, ceiling); computeBudget.observe('s' + i + kind, 61000 + i * 1000); }
             }
             const base = { connection: { id: 1 }, user, mint: mint.toBase58(), solAmount: 0.25, slippagePct: 20, tipSol: te.handBuiltPlan(fee, ceiling, config.SEND_VIA === 'sender' ? config.SENDER_TIP : config.JITO_TIP).tip ? (config.SEND_VIA === 'sender' ? config.SENDER_TIP : config.JITO_TIP) : 0,
@@ -1547,6 +1550,15 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
           out.exactSolIn = buyIx && Buffer.from(buyIx.data).subarray(0, 8).toString('hex') === '38fc74089edfcd5f' && Buffer.from(buyIx.data).readBigUInt64LE(8) === 250000000n;
           out.sigMatches = ${JSON.stringify(via)} === 'sender' ? sig === bs58.encode(tx.signatures[0]) : true;
           out.url = req.url;
+          out.programs = tx.message.compiledInstructions.map((ix) => keys[ix.programIdIndex].slice(0, 6));
+          out.marked = plainAccount.marked(mint.toBase58());
+          if (plainMode) {
+            // A second buy of the same coin falls back to the usual ATA.
+            const again = await d.buildPumpfunBuyTx({ connection: { id: 1 }, user, mint: mint.toBase58(), solAmount: 0.25, slippagePct: 20, tipSol: 0.001, computeUnitLimit: ceiling, fastHint: hintFor(mint, TOKEN_2022_PROGRAM_ID), maxMcapSol: 300, minMcapSol: null, handBuilt: te.handBuiltPlan(fee, ceiling, 0.001) });
+            const again2 = VersionedTransaction.deserialize(again.serialize());
+            const ks = again2.message.staticAccountKeys.map(String);
+            out.againPrograms = again2.message.compiledInstructions.map((ix) => ks[ix.programIdIndex].slice(0, 6));
+          }
           // A Pump.fun upgrade the SDK knows about but this module doesn't: switched off, SDK route used.
           const orig = sdk.PUMP_SDK.buyInstructions.bind(sdk.PUMP_SDK);
           sdk.PUMP_SDK.buyInstructions = async (args) => { const ixs = await orig(args); const last = ixs[ixs.length - 1]; last.keys.push({ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: false }); return ixs; };
@@ -1559,6 +1571,7 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
         })().catch((e) => console.log('ERR ' + e.stack));
       `;
       const env = { ...process.env, SHRED_FAST_BUY: 'true', MAX_MARKET_CAP_SOL: '300', BUY_PRIORITY_FEE_SOL: '0.0015', PUMPFUN_COMPUTE_UNITS: '130000' };
+      if (plain) env.TOKEN_ACCOUNT_MODE = 'plain';
       if (via === 'sender') Object.assign(env, { SEND_VIA: 'sender', SENDER_TIP: '0.0016' });
       else delete env.SEND_VIA;
       const r = spawnSync(process.execPath, ['-e', script], { cwd: root, env, encoding: 'utf8' });
@@ -1574,13 +1587,120 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
       check(via === 'sender' ? /sender/.test(out.url) : /127\.0\.0\.1:1\/api\/v1\/transactions/.test(out.url), `sent the ${via} way (${out.url})`);
       check(out.afterChange === null && /layout changed/.test(out.disabled || ''), `a changed layout switches it off (${JSON.stringify(out.afterChange)}, ${out.disabled})`);
       check(out.fallback, 'then buys use the SDK route');
+      if (plain) {
+        const p = out.programs || [];
+        check(!p.includes('ATokenG'.slice(0, 6)) && p.includes('Tokenz') && p.includes('111111'), `no ATA program in the buy, a System create and Token-2022 initialise instead (${p.join(',')})`);
+        check(out.marked === true, 'the coin is noted as bought with a plain account');
+        check((out.againPrograms || []).includes('ATokenG'.slice(0, 6)), `a second buy of the coin uses the ATA (${(out.againPrograms || []).join(',')})`);
+      } else {
+        check((out.programs || []).includes('AToken'), 'default: the ATA program makes the account');
+      }
     });
   }
 
-  {
+  await test('plain token account: address and instructions match web3.js and spl-token; sells find tokens in either account', async () => {
+    const pa = require(src('plainAccount.js'));
+    const spl = require('@solana/spl-token');
+    const user = Keypair.generate().publicKey;
+    pa._resetForTests();
+    pa._setT22Len(170);
+    check(pa.lamportsFor(165) === 2039280, `rent for 165 bytes is 2,039,280 (${pa.lamportsFor(165)})`);
+    for (const program of [spl.TOKEN_PROGRAM_ID, spl.TOKEN_2022_PROGRAM_ID]) {
+      const is22 = program.equals(spl.TOKEN_2022_PROGRAM_ID);
+      const mintPk = Keypair.generate().publicKey;
+      const mint = mintPk.toBase58();
+      const seed = pa.seedFor(mint, 'node');
+      const want = await PublicKey.createWithSeed(user, seed, program);
+      check(pa.addressFor(user, mint, program).equals(want), 'the address is the one createWithSeed gives');
+      const rustSeed = pa.seedFor(mint, 'rust');
+      check(rustSeed !== seed && rustSeed.length === 32 && !pa.addressFor(user, mint, program, 'rust').equals(want), 'the Rust path uses a different seed (so a different address)');
+      const len = is22 ? 170 : 165;
+      const made = pa.createInstructions({ userBytes: user.toBuffer(), mint, programBytes: program.toBuffer() });
+      check(made && new PublicKey(made.address).equals(want), 'instructions are for that address');
+      const sys = SystemProgram.createAccountWithSeed({ fromPubkey: user, newAccountPubkey: want, basePubkey: user, seed, lamports: pa.lamportsFor(len), space: len, programId: program });
+      check(made.ixs[0].data.equals(Buffer.from(sys.data)), 'System create-with-seed data is the same as web3.js writes');
+      check(made.ixs[0].keys.length === sys.keys.length && made.ixs[0].keys.every((k, i) => new PublicKey(k.key).equals(sys.keys[i].pubkey) && k.isSigner === sys.keys[i].isSigner && k.isWritable === sys.keys[i].isWritable), 'and the same accounts');
+      const init = spl.createInitializeAccount3Instruction(want, mintPk, user, program);
+      const last = made.ixs[made.ixs.length - 1];
+      check(last.data.equals(Buffer.from(init.data)) && last.keys.every((k, i) => new PublicKey(k.key).equals(init.keys[i].pubkey) && k.isWritable === init.keys[i].isWritable), 'InitializeAccount3 is the same as spl-token writes');
+      check(made.ixs.length === (is22 ? 3 : 2), `${is22 ? 'Token-2022 also sets the immutable owner' : 'two instructions for a classic token account'}`);
+      if (is22) check(made.ixs[1].data.equals(Buffer.from(spl.createInitializeImmutableOwnerInstruction(want, program).data)), 'InitializeImmutableOwner is the same');
+      // Transfers between accounts
+      const to = spl.getAssociatedTokenAddressSync(mintPk, user, true, program);
+      const [mv] = pa.moveInstructions({ user, mint, program, decimals: 6, to, moves: [{ address: want, raw: 123456789n }] });
+      const ref = spl.createTransferCheckedInstruction(want, mintPk, to, user, 123456789n, 6, [], program);
+      check(Buffer.from(mv.data).equals(Buffer.from(ref.data)) && mv.keys.every((k, i) => k.pubkey.equals(ref.keys[i].pubkey) && k.isSigner === ref.keys[i].isSigner && k.isWritable === ref.keys[i].isWritable), 'a move is the same TransferChecked spl-token writes');
+    }
+    // Plan: off by default, on with the mode, ATA again once bought, Token-2022 only once its length is known.
+    const config = require(src('config.js'));
+    const mintStr = Keypair.generate().publicKey.toBase58();
+    const args = { userBytes: user.toBuffer(), mint: mintStr, programBytes: spl.TOKEN_PROGRAM_ID.toBuffer() };
+    check(pa.plan(args) === null, 'mode ata (default): no plain account');
+    config.TOKEN_ACCOUNT_MODE = 'plain';
+    check(pa.plan(args) && pa.plan(args).kindPrograms.join() === 'Tokenk', 'mode plain: a plain account');
+    pa._resetForTests();
+    check(pa.plan({ ...args, programBytes: spl.TOKEN_2022_PROGRAM_ID.toBuffer() }) === null, 'Token-2022 length not known yet: the ATA');
+    pa._setT22Len(170);
+    check(pa.plan({ ...args, programBytes: spl.TOKEN_2022_PROGRAM_ID.toBuffer() }).kindPrograms.join() === 'Tokenz,Tokenz', 'Token-2022 length known: plain');
+    pa.noteBuy(mintStr, 'node');
+    check(pa.plan(args) === null && pa.plan({ ...args, builder: 'rust' }) !== null, 'a coin bought with a plain account is bought with the ATA the next time (the Rust path has its own account)');
+    check(pa.guess(user, mintStr, spl.TOKEN_PROGRAM_ID).equals(pa.addressFor(user, mintStr, spl.TOKEN_PROGRAM_ID, 'node')), 'a sell built before the buy lands guesses the plain account');
+    config.TOKEN_ACCOUNT_MODE = 'ata';
+    // Where a sell takes the tokens from
+    const acct = (n) => ({ data: (() => { const b = Buffer.alloc(165); b.writeBigUInt64LE(BigInt(n), 64); return b; })() });
+    const list = pa.holders(user, mintStr, spl.TOKEN_PROGRAM_ID);
+    let src1 = pa.sellSource(list, [null, acct(500), null]);
+    check(src1.from.equals(list[1].address) && !src1.move.length && src1.found, 'tokens only in the plain account: sell from it');
+    src1 = pa.sellSource(list, [acct(40), null, null]);
+    check(src1.from.equals(list[0].address) && !src1.move.length, 'tokens only in the ATA: as before');
+    src1 = pa.sellSource(list, [acct(40), acct(500), null]);
+    check(src1.from.equals(list[0].address) && src1.move.length === 1 && src1.move[0].raw === 500n && src1.move[0].address.equals(list[1].address), 'tokens in both: collected in the ATA first');
+    src1 = pa.sellSource(list, [null, null, null]);
+    check(!src1.found && src1.from.equals(list[0].address), 'nothing found (before the buy landed): not found, ATA');
+    pa._resetForTests();
+    try { fs.unlinkSync(path.join(root, 'data', 'plain-mints.json')); } catch {}
+  });
+
+  await test('plain token account: a Pump.fun sell takes the tokens from the plain account, moving a second account into it first', async () => {
+    const spl = require('@solana/spl-token');
+    const { TransactionInstruction } = require('@solana/web3.js');
+    const pa = require(src('plainAccount.js'));
+    const dKey = require.resolve(src('pumpfunDirect.js'));
+    const dSaved = require.cache[dKey];
+    delete require.cache[dKey]; // an earlier test may have swapped in a stand-in
+    const d = require(dKey);
+    pa._resetForTests();
+    const user = Keypair.generate().publicKey;
+    const mint = Keypair.generate().publicKey.toBase58();
+    const program = spl.TOKEN_2022_PROGRAM_ID;
+    const list = pa.holders(user, mint, program);
+    const ata = list[0].address;
+    const sellIx = new TransactionInstruction({ programId: Keypair.generate().publicKey, keys: [{ pubkey: user, isSigner: true, isWritable: true }, { pubkey: ata, isSigner: false, isWritable: true }], data: Buffer.from([1, 2, 3]) });
+    const acct = (n) => ({ data: (() => { const b = Buffer.alloc(165); b.writeBigUInt64LE(BigInt(n), 64); return b; })() });
+    const place = (infos, holders = { list, infos }) => d.placeSellAccount({ instructions: [sellIx], st: { holders }, user, mint, tokenProgram: program, decimals: 6 });
+    let out = place([null, acct(900), null]);
+    check(out.length === 1 && out[0].keys[1].pubkey.equals(list[1].address) && out[0].keys[0].pubkey.equals(user) && out[0].data.equals(sellIx.data), 'only the plain account holds tokens: the sell uses it');
+    out = place([acct(5), null, null]);
+    check(out.length === 1 && out[0] === sellIx, 'tokens in the ATA: the sell is untouched');
+    out = place([acct(5), acct(900), null]);
+    check(out.length === 2 && out[0].keys[0].pubkey.equals(list[1].address) && out[1] === sellIx, 'tokens in both: moved into the ATA, then the usual sell');
+    out = place([null, null, null]);
+    check(out.length === 1 && out[0] === sellIx, 'nothing found and no purchase noted: the ATA');
+    out = d.placeSellAccount({ instructions: [sellIx], st: { holders: null }, user, mint, tokenProgram: program, decimals: 6 });
+    check(out.length === 1 && out[0] === sellIx, 'plain accounts never used: nothing changes');
+    // A sell built before the buy landed uses the account this bot's buy made.
+    pa.noteBuy(mint, 'node');
+    out = place([null, null, null]);
+    check(out.length === 1 && out[0].keys[1].pubkey.equals(list[1].address), 'built before the buy landed: the account the bot made');
+    if (dSaved) require.cache[dKey] = dSaved; else delete require.cache[dKey];
+    pa._resetForTests();
+    try { fs.unlinkSync(path.join(root, 'data', 'plain-mints.json')); } catch {}
+  });
+
+  for (const plain of [false, true]) {
     const bin = process.env.__FASTPATH_BIN;
     const have = bin && fs.existsSync(bin);
-    await test(`FAST_PATH=rust: the Rust fast path checks out byte for byte, then buys from the shred feed itself${have ? '' : ' (SKIPPED: fastpath not built)'}`, async () => {
+    await test(`FAST_PATH=rust${plain ? ' with TOKEN_ACCOUNT_MODE=plain' : ''}: the Rust fast path checks out byte for byte, then buys from the shred feed itself${have ? '' : ' (SKIPPED: fastpath not built)'}`, async () => {
       if (!have) return;
       const script = `
         const http = require('http');
@@ -1704,6 +1824,8 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
               out.guarded = tx.message.compiledInstructions.some((c) => k[c.programIdIndex] === 'L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95' && Buffer.from(c.data).readBigUInt64LE(3) === 5001n);
               out.sigMatches = m1 && m1.outcome.signature === bs58.encode(tx.signatures[0]);
               out.toSender = s1.url.startsWith('/fast');
+              out.programs = tx.message.compiledInstructions.map((c) => k[c.programIdIndex].slice(0, 6));
+              out.plainFlag = m1 && m1.outcome.plain;
               out.readyMs = m1 && m1.marks && m1.marks.signed;
             }
             // The same transaction again (repeat): not bought twice.
@@ -1772,6 +1894,7 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
         })();
       `;
       const env = { ...process.env, SHRED_FAST_BUY: 'true', MAX_MARKET_CAP_SOL: '300', BUY_PRIORITY_FEE_SOL: '0.0015', PUMPFUN_COMPUTE_UNITS: '130000', SENDER_TIP: '0.0016', MAX_SLOTS_BEHIND: '1' };
+      if (plain) Object.assign(env, { TOKEN_ACCOUNT_MODE: 'plain', TOKEN_2022_ACCOUNT_BYTES: '170' });
       const r = spawnSync(process.execPath, ['-e', script], { cwd: root, env, encoding: 'utf8', timeout: 60000 });
       const line = (r.stdout || '').trim().split('\n').filter((l) => l.startsWith('{')).pop() || '';
       let out = null;
@@ -1783,6 +1906,8 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
       check(out.status === 'bought', `bought it (${out.status}: ${out.reason})${ctx}`);
       check(out.verifies && out.sigMatches && out.toSender, 'signed by the wallet, sent to Sender, reported with its signature');
       check(out.spend === '50000000' && out.vaultOk && out.guarded, `0.05 SOL buy_exact_sol_in, his creator vault, slot guard at his slot + 1 (${out.spend}, ${out.vaultOk}, ${out.guarded})`);
+      if (plain) check(out.plainFlag === true && !(out.programs || []).includes('AToken') && (out.programs || []).includes('Tokenz'), `the Rust path made a plain token account (${out.plainFlag}; ${(out.programs || []).join(',')})`);
+      else check((out.programs || []).includes('AToken'), 'default: the ATA program makes the account');
       check(out.sentOnce, 'a repeated transaction is not bought twice');
       check(/declined: our own buy of this coin is still in flight/.test(out.secondSameCoin || ''), `a second buy of the same coin waits for the first (${out.secondSameCoin})`);
       check(out.claimed, 'claimed his transaction before sending');

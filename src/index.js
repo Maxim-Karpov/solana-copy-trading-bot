@@ -56,6 +56,7 @@ const getTimestamp = require('../utils/getTimestamp');
 const { PublicKey, Keypair } = require('@solana/web3.js');
 const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync } = require('@solana/spl-token');
 const accountCleaner = require('./accountCleaner');
+const plainAccount = require('./plainAccount');
 const tokenTax = require('./tokenTax');
 const { isStockToken, stockLabel } = require('./stockTokens');
 let bs58;
@@ -1225,18 +1226,25 @@ process.on('uncaughtException', (err) => {
     // follow, or null (nothing sent: the close then sells the usual way).
     async function heldAtProcessed(mint) {
       const mintPk = new PublicKey(mint);
-      const [classic, t22, mintAcc] = await rpcPool.withFailover((conn) =>
+      // TOKEN_ACCOUNT_MODE=plain: the tokens may be in a plain account (made by the bot or the Rust path) as well as the ATA.
+      const extra = plainAccount.everUsed() ? [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].map((p) => plainAccount.holders(walletPubkey, mint, p).slice(1).map((h) => h.address)) : [[], []];
+      const [classic, t22, mintAcc, ...others] = await rpcPool.withFailover((conn) =>
         conn.getMultipleAccountsInfo(
           [
             getAssociatedTokenAddressSync(mintPk, walletPubkey, true, TOKEN_PROGRAM_ID),
             getAssociatedTokenAddressSync(mintPk, walletPubkey, true, TOKEN_2022_PROGRAM_ID),
-            mintPk
+            mintPk,
+            ...extra[0],
+            ...extra[1]
           ],
           'processed'
         )
       );
-      const acc = mintAcc && mintAcc.owner.equals(TOKEN_2022_PROGRAM_ID) ? t22 : classic;
-      const raw = acc && acc.data && acc.data.length >= 72 ? Buffer.from(acc.data).readBigUInt64LE(64) : 0n;
+      const is22 = mintAcc && mintAcc.owner.equals(TOKEN_2022_PROGRAM_ID);
+      const acc = is22 ? t22 : classic;
+      let raw = acc && acc.data && acc.data.length >= 72 ? Buffer.from(acc.data).readBigUInt64LE(64) : 0n;
+      const mine = is22 ? others.slice(extra[0].length) : others.slice(0, extra[0].length);
+      for (const a of mine) raw += plainAccount.amountOf(a) || 0n;
       const decimals = mintAcc && mintAcc.data && mintAcc.data.length >= 45 ? Buffer.from(mintAcc.data).readUInt8(44) : null;
       return { raw, decimals };
     }
@@ -1266,8 +1274,10 @@ process.on('uncaughtException', (err) => {
         return () => {};
       }
       for (const program of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+        // The ATA, and (TOKEN_ACCOUNT_MODE=plain) the plain accounts the tokens may arrive in.
+        const places = plainAccount.everUsed() ? plainAccount.holders(walletPubkey, mint, program).map((h) => h.address) : [getAssociatedTokenAddressSync(mintPk, walletPubkey, true, program)];
+        for (const ata of places) {
         try {
-          const ata = getAssociatedTokenAddressSync(mintPk, walletPubkey, true, program);
           ids.push(
             conn.onAccountChange(
               ata,
@@ -1284,6 +1294,7 @@ process.on('uncaughtException', (err) => {
           );
         } catch {
           // no websocket: the status polling still catches the landing
+        }
         }
       }
       return () => {
@@ -1933,6 +1944,7 @@ process.on('uncaughtException', (err) => {
           buySig = fastSent.signature;
           sentAt = fastSent.sentAt || null;
           tradeExecutorMod.noteExternalBuy(buySig, { buildMs: fastSent.buildMs, sendMs: fastSent.sendMs, sentAt, guard: fastSent.guard, compute: fastSent.compute });
+          if (fastSent.plain) plainAccount.noteBuy(mint, 'rust'); // its tokens are in a plain account
           if (fastPath) {
             fastPath.ack(buySig);
             fastPath.pushState();
@@ -2503,6 +2515,12 @@ process.on('uncaughtException', (err) => {
 
     // PREWARM: blockhash + Pump.fun config kept warm for one-lookup trades.
     prewarm.start().catch((err) => warn(`[Prewarm] Not started: ${err.message}`));
+    // TOKEN_ACCOUNT_MODE=plain: learn the Token-2022 token account length from the wallet's own accounts.
+    try {
+      plainAccount.startLearning(rpcPool.getConnection(), walletPubkey);
+    } catch (err) {
+      warn(`[plainAccount] Not started: ${err.message}`);
+    }
     // QUOTE_TOKENS: reserves of the tokens some Pump.fun coins are paired to.
     if (quoteTokens.enabled() && config.DIRECT_PUMPFUN_SWAP) {
       const jupiterOk = Boolean(config.JUPITER_API_KEY);

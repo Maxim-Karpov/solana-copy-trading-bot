@@ -438,6 +438,19 @@ if (!/^https?:\/\//.test(config.SENDER_ENDPOINT)) fail(`SENDER_ENDPOINT must be 
 config.SENDER_SWQOS_ONLY = process.env.SENDER_SWQOS_ONLY === 'true';
 // A BUY that Sender turns away with 429 is not sent again (it would land late); sells always are.
 config.BUY_RETRY_ON_SENDER_429 = process.env.BUY_RETRY_ON_SENDER_429 === 'true';
+
+// How a fast Pump.fun buy gets its token account. "ata" (default): the usual
+// Associated Token Account, made by its program (about 17,000 compute units).
+// "plain": made directly with the System and Token programs (about 2,500), at
+// an address worked out from the coin's address. Same account type; more fee
+// per compute unit at the same total fee. See src/plainAccount.js.
+config.TOKEN_ACCOUNT_MODE = (process.env.TOKEN_ACCOUNT_MODE || 'ata').trim().toLowerCase();
+// Length in bytes of a Token-2022 token account of these coins (normally learned
+// from the wallet's own accounts; set it only if learning can't work). Plain mode only.
+config.TOKEN_2022_ACCOUNT_BYTES = numEnv('TOKEN_2022_ACCOUNT_BYTES', { def: null, min: 165, max: 400, integer: true });
+if (!['ata', 'plain'].includes(config.TOKEN_ACCOUNT_MODE)) {
+  throw new Error(`TOKEN_ACCOUNT_MODE must be "ata" or "plain" (got "${process.env.TOKEN_ACCOUNT_MODE}")`);
+}
 config.SENDER_MEV_PROTECT = process.env.SENDER_MEV_PROTECT === 'true';
 const senderMinTip = config.SENDER_SWQOS_ONLY ? 0.000005 : 0.001;
 config.SENDER_TIP = numEnv('SENDER_TIP', { def: senderMinTip, min: 0 }); // SOL

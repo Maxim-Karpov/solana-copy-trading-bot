@@ -253,7 +253,9 @@ class FastPath extends EventEmitter {
         worstFeeBps: worstFeeBpsFor(global)
       },
       senderTips: SENDER_TIP_ACCOUNTS.map(String),
-      jitoTips: JITO_TIP_ACCOUNTS.map(String)
+      jitoTips: JITO_TIP_ACCOUNTS.map(String),
+      // TOKEN_ACCOUNT_MODE=plain: the Rust path makes plain token accounts too (Token-2022 once the length is known).
+      plain: require('./plainAccount').enabled() ? { t22Len: require('./plainAccount').accountLen(require('@solana/spl-token').TOKEN_2022_PROGRAM_ID) } : undefined
     });
   }
 

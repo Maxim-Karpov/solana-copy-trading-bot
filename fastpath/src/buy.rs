@@ -42,6 +42,15 @@ pub struct Template {
     pub worst_fee_bps: u128,
     pub sender_tips: Vec<Pubkey>,
     pub jito_tips: Vec<Pubkey>,
+    /// TOKEN_ACCOUNT_MODE=plain: Some(Token-2022 account length, once known).
+    pub plain: Option<Option<usize>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlainMsg {
+    #[serde(default)]
+    pub t22_len: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +66,8 @@ pub struct TemplateMsg {
     pub sender_tips: Vec<String>,
     #[serde(default)]
     pub jito_tips: Vec<String>,
+    #[serde(default)]
+    pub plain: Option<PlainMsg>,
 }
 
 #[derive(Deserialize)]
@@ -98,6 +109,7 @@ impl Template {
             worst_fee_bps: m.min_out.worst_fee_bps as u128,
             sender_tips: m.sender_tips.iter().map(|s| pk(s)).collect::<Result<_>>()?,
             jito_tips: m.jito_tips.iter().map(|s| pk(s)).collect::<Result<_>>()?,
+            plain: m.plain.as_ref().map(|p| p.t22_len),
         })
     }
 }
@@ -179,6 +191,81 @@ pub fn coin_accounts(mint: &Pubkey, present: &(dyn Fn(&Pubkey) -> bool + Sync), 
         .unwrap_or_else(|| find_pda(&[b"bonding-curve-v2", mint.bytes()], &pump));
     let associated_user = find_pda(&[user.bytes(), token_program.bytes(), mint.bytes()], &ata);
     Ok(CoinAccounts { curve, abc, curve_v2, token_program, associated_user })
+}
+
+/// TOKEN_ACCOUNT_MODE=plain: the buyer's token account made with the System and
+/// Token programs instead of the ATA program (port of src/plainAccount.js).
+/// This builder's seed is the coin's address shifted by one character, so the
+/// accounts never clash with the Node bot's.
+pub struct PlainPlan {
+    pub address: Pubkey,
+    pub ixs: Vec<Instruction>,
+    /// The program names computeBudget.kindOf shows for these instructions.
+    pub kind: &'static str,
+}
+
+const CLASSIC_LEN: usize = 165;
+const RENT_PER_BYTE: u64 = 6960;
+const RENT_BASE_BYTES: u64 = 128;
+
+pub fn plain_seed(mint: &Pubkey) -> Option<String> {
+    let s = mint.b58();
+    if s.len() < 33 {
+        return None;
+    }
+    Some(s[1..33].to_string())
+}
+
+/// sha256(base | seed | owner): Pubkey::create_with_seed.
+pub fn create_with_seed(base: &Pubkey, seed: &str, owner: &Pubkey) -> Pubkey {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(base.bytes());
+    h.update(seed.as_bytes());
+    h.update(owner.bytes());
+    Pubkey(h.finalize().into())
+}
+
+/// The plain account for this buy, or None (use the ATA): the mode is off, the
+/// account length isn't known (Token-2022 until the Node bot has learned it),
+/// or this coin was already bought this way.
+pub fn plain_plan(t: &Template, mint: &Pubkey, token_program: &Pubkey, already: &dyn Fn(&Pubkey) -> bool) -> Option<PlainPlan> {
+    let t22_len = t.plain?;
+    if already(mint) {
+        return None;
+    }
+    let is22 = *token_program == known::token_2022();
+    let len = if is22 {
+        t22_len?
+    } else if *token_program == known::token() {
+        CLASSIC_LEN
+    } else {
+        return None;
+    };
+    let seed = plain_seed(mint)?;
+    let user = t.user;
+    let address = create_with_seed(&user, &seed, token_program);
+    let m = |key: Pubkey, signer: bool, writable: bool| Meta { key, signer, writable };
+    let mut data = Vec::with_capacity(124);
+    data.extend_from_slice(&3u32.to_le_bytes());
+    data.extend_from_slice(user.bytes());
+    data.extend_from_slice(&(seed.len() as u64).to_le_bytes());
+    data.extend_from_slice(seed.as_bytes());
+    data.extend_from_slice(&((RENT_BASE_BYTES + len as u64) * RENT_PER_BYTE).to_le_bytes());
+    data.extend_from_slice(&(len as u64).to_le_bytes());
+    data.extend_from_slice(token_program.bytes());
+    let mut ixs = vec![Instruction { program: known::system(), keys: vec![m(user, true, true), m(address, false, true)], data }];
+    if is22 {
+        ixs.push(Instruction { program: *token_program, keys: vec![m(address, false, true)], data: vec![22] });
+    }
+    let mut init = vec![18u8];
+    init.extend_from_slice(user.bytes());
+    ixs.push(Instruction { program: *token_program, keys: vec![m(address, false, true), m(input_mint(mint), false, false)], data: init });
+    Some(PlainPlan { address, ixs, kind: if is22 { "Tokenz+Tokenz" } else { "Tokenk" } })
+}
+
+fn input_mint(m: &Pubkey) -> Pubkey {
+    *m
 }
 
 pub struct Instruction {
@@ -306,6 +393,7 @@ pub struct BuyInput<'a> {
     pub guard_max_slot: Option<u64>,
     pub tip: Option<(Pubkey, u64)>,
     pub blockhash: [u8; 32],
+    pub plain: Option<&'a PlainPlan>,
 }
 
 pub struct BuiltBuy {
@@ -330,7 +418,7 @@ pub fn build_buy(input: &BuyInput, acc: &CoinAccounts) -> Result<BuiltBuy> {
     keys[ROLE_MINT].key = input.mint;
     keys[ROLE_BONDING_CURVE].key = acc.curve;
     keys[ROLE_ASSOCIATED_BONDING_CURVE].key = acc.abc;
-    keys[ROLE_ASSOCIATED_USER].key = acc.associated_user;
+    keys[ROLE_ASSOCIATED_USER].key = input.plain.map(|p| p.address).unwrap_or(acc.associated_user);
     keys[ROLE_TOKEN_PROGRAM].key = acc.token_program;
     keys[ROLE_CREATOR_VAULT].key = input.creator_vault;
     keys[ROLE_BONDING_CURVE_V2].key = acc.curve_v2;
@@ -359,18 +447,24 @@ pub fn build_buy(input: &BuyInput, acc: &CoinAccounts) -> Result<BuiltBuy> {
         ixs.len() - 1
     });
     let m = |key: Pubkey, signer: bool, writable: bool| Meta { key, signer, writable };
-    ixs.push(Instruction {
-        program: known::ata_program(),
-        keys: vec![
-            m(user, true, true),
-            m(acc.associated_user, false, true),
-            m(user, false, false),
-            m(input.mint, false, false),
-            m(known::system(), false, false),
-            m(acc.token_program, false, false),
-        ],
-        data: vec![1],
-    });
+    if let Some(p) = input.plain {
+        for ix in &p.ixs {
+            ixs.push(Instruction { program: ix.program, keys: ix.keys.clone(), data: ix.data.clone() });
+        }
+    } else {
+        ixs.push(Instruction {
+            program: known::ata_program(),
+            keys: vec![
+                m(user, true, true),
+                m(acc.associated_user, false, true),
+                m(user, false, false),
+                m(input.mint, false, false),
+                m(known::system(), false, false),
+                m(acc.token_program, false, false),
+            ],
+            data: vec![1],
+        });
+    }
     ixs.push(Instruction { program: known::pump(), keys, data });
     if let Some((account, lamports)) = input.tip {
         if lamports > 0 {
@@ -384,9 +478,10 @@ pub fn build_buy(input: &BuyInput, acc: &CoinAccounts) -> Result<BuiltBuy> {
 }
 
 /// computeBudget.kindOf's key for this buy.
-pub fn kind_of(guarded: bool, token_program: &Pubkey) -> String {
+pub fn kind_of(guarded: bool, token_program: &Pubkey, plain: Option<&PlainPlan>) -> String {
     let t22 = if *token_program == known::token_2022() { "t22" } else { "spl" };
-    format!("buy|{}AToken+6EF8rr|{t22}|a{BUY_ACCOUNTS}", if guarded { "L2TExM+" } else { "" })
+    let create = plain.map(|p| p.kind).unwrap_or("AToken");
+    format!("buy|{}{create}+6EF8rr|{t22}|a{BUY_ACCOUNTS}", if guarded { "L2TExM+" } else { "" })
 }
 
 /// The signed wire transaction: 1 signature, then the message.
@@ -461,6 +556,7 @@ mod bench {
             worst_fee_bps: 125,
             sender_tips: vec![rnd(8)],
             jito_tips: vec![],
+            plain: None,
         };
         let sk = SigningKey::from_bytes(&[9u8; 32]);
         let n = 20000;
@@ -476,7 +572,7 @@ mod bench {
             let acc = coin_accounts(&mint, &present, &user, None).unwrap();
             let plan = fee_plan(0.0015, 130000, true, None);
             let min_out = min_tokens_at_mcap(&t, 50_000_000, 300.0) as u64;
-            let input = BuyInput { template: &t, mint, creator_vault: rnd(5), fee_recipient: rnd(7), lamports: 50_000_000, min_out, plan: &plan, guard_max_slot: Some(123), tip: Some((rnd(8), 1_600_000)), blockhash: [3u8; 32] };
+            let input = BuyInput { template: &t, mint, creator_vault: rnd(5), fee_recipient: rnd(7), lamports: 50_000_000, min_out, plan: &plan, guard_max_slot: Some(123), tip: Some((rnd(8), 1_600_000)), blockhash: [3u8; 32], plain: None };
             let b = build_buy(&input, &acc).unwrap();
             let sig = sk.sign(&b.message).to_bytes();
             let w = wire(&sig, &b.message);
