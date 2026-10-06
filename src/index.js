@@ -57,6 +57,7 @@ const { PublicKey, Keypair } = require('@solana/web3.js');
 const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync } = require('@solana/spl-token');
 const accountCleaner = require('./accountCleaner');
 const plainAccount = require('./plainAccount');
+const dcaSell = require('./dcaSell');
 const tokenTax = require('./tokenTax');
 const { isStockToken, stockLabel } = require('./stockTokens');
 let bs58;
@@ -164,7 +165,7 @@ process.on('uncaughtException', (err) => {
         `RPC fallbacks=${config.SOLANA_RPC_FALLBACKS.length}, mirror transfers=${config.MIRROR_TRANSFERS}, ` +
         `skip rebuys=${config.SKIP_REBUYS}, detection=${config.DETECTION_COMMITMENT}/${config.DETECTION_FEED}${config.SHRED_SOURCE ? ` + shreds (${config.SHRED_SOURCE})` : ''}, ` +
         `max entry premium=${config.MAX_ENTRY_PREMIUM_PCT === null ? 'off' : `${config.MAX_ENTRY_PREMIUM_PCT}%`}, ` +
-        `sell after=${config.INSTANT_SELL ? `instant (as soon as the buy lands${config.INSTANT_SELL_DELAY_MS > 0 ? `, +${config.INSTANT_SELL_DELAY_MS}ms` : ''})` : config.SELL_AFTER_SECONDS > 0 ? `${config.SELL_AFTER_SECONDS}s` : 'off'}, ` +
+        `sell after=${config.INSTANT_SELL ? `instant (as soon as the buy lands${config.INSTANT_SELL_DELAY_MS > 0 ? `, +${config.INSTANT_SELL_DELAY_MS}ms` : ''}${dcaSell.active() ? `; sold in parts: ${dcaSell.label()}` : ''})` : config.SELL_AFTER_SECONDS > 0 ? `${config.SELL_AFTER_SECONDS}s` : 'off'}, ` +
         `buy filters=${filtersText()}, ` +
         `max open positions=${config.MAX_OPEN_POSITIONS || 'no limit'}, ` +
         `buy cooldown=${config.BUY_COOLDOWN_SEC ? `${config.BUY_COOLDOWN_SEC}s` : 'off'}, ` +
@@ -202,6 +203,20 @@ process.on('uncaughtException', (err) => {
       }
     }
 
+    // DCA_SELLING chosen in Telegram wins over the file; a position that was being sold in parts when
+    // the bot stopped has its rest sold at once (the retry loop picks the exit up).
+    {
+      const saved = storage.getDcaMode();
+      if (saved) dcaSell.setMode(saved);
+      for (const p of activeMap.values()) {
+        if (p.dca) {
+          const updates = { dca: null, pending_exit: 'DCA (bot restarted): selling the rest', needs_reconcile: true };
+          Object.assign(p, updates);
+          storage.updatePosition(p.id, updates);
+          warn(`[Main] Position ${shortId(p.id)} (${p.mint}) was being sold in parts when the bot stopped; its rest is sold at once now.`);
+        }
+      }
+    }
     // Ids of positions with a sell running, and with a sell queued.
     const closingSet = new Set();
     const queuedSells = new Set();
@@ -767,7 +782,7 @@ process.on('uncaughtException', (err) => {
      * are what actually left / arrived in the wallet.
      * Otherwise it falls back to a price-based estimate, marked "(est.)".
      */
-    async function reportSellPnl(pos, reason, soldPct, costs, sale, priorRealized = 0) {
+    async function reportSellPnl(pos, reason, soldPct, costs, sale, priorRealized = 0, { quiet = false } = {}) {
       let pnlSol = null;
       let pnlPct = null;
       let realized = false;
@@ -819,7 +834,7 @@ process.on('uncaughtException', (err) => {
         `[Main][PnL] ${reason}: sold ${soldPct.toFixed(2)}% of ${pos.mint} (position ${shortId(pos.id)}). ` +
           `PnL: ${pnlText} — ${detail}.`
       );
-      telegramBot.notifySell({ pos, reason, soldPct, pnlSol, pnlPct, realized });
+      if (!quiet) telegramBot.notifySell({ pos, reason, soldPct, pnlSol, pnlPct, realized });
       return pnlSol;
     }
 
@@ -845,7 +860,7 @@ process.on('uncaughtException', (err) => {
     // of sending another; if it fails, later attempts sell as usual.
     // A transaction can no longer land once its blockhash is ~150 blocks old (~60 s); this is the margin.
     const SELL_EXPIRY_MS = process.env.SELL_EXPIRY_MS !== undefined ? Number(process.env.SELL_EXPIRY_MS) : 90_000;
-    async function sellWithRetries(pos, desiredRaw, decimals, { full, stopIf = null, trackedKnown = true, alreadySent = null }) {
+    async function sellWithRetries(pos, desiredRaw, decimals, { full, stopIf = null, trackedKnown = true, alreadySent = null, cheap = false, maxAttempts = config.SELL_MAX_ATTEMPTS, confirmSec = config.CONFIRM_TIMEOUT_SEC }) {
       // trackedKnown=false: the stored amount is stale (a buy's fill couldn't
       // be read), so a full sell takes the whole on-chain balance.
       const trackedRaw = trackedKnown ? uiToRaw(pos.token_amount, decimals) : 0n;
@@ -865,7 +880,7 @@ process.on('uncaughtException', (err) => {
         return { ok: true, signature, proceedsSol, swapProceedsSol, sellFeesSol, soldRaw, valuedIn: measured ? measured.valuedIn || null : null };
       };
 
-      for (let attempt = 1; attempt <= config.SELL_MAX_ATTEMPTS; attempt++) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
           if (attempt > 1 && !full && lastSig && maybeLanded) {
             // A partial sell that may still land can't be sent again until it can
@@ -919,7 +934,8 @@ process.on('uncaughtException', (err) => {
               tip: config.JITO_TIP,
               dex: pos.dex,
               venue: pos.venue,
-              pool: pos.pool || null
+              pool: pos.pool || null,
+              cheap: cheap && attempt === 1 // DCA slice: Jito with the small tip; a retry goes the usual fast way
             });
           } catch (err) {
             // An ambiguous send (connection dropped after the request went
@@ -940,19 +956,19 @@ process.on('uncaughtException', (err) => {
           // re-reads the balance); a partial one waits longer, since selling
           // the same % twice would sell too much.
           const ambiguousWaitSec = full ? 8 : 20;
-          const conf = await waitForConfirmation(signature, ambiguous ? Math.min(ambiguousWaitSec, config.CONFIRM_TIMEOUT_SEC) : config.CONFIRM_TIMEOUT_SEC);
+          const conf = await waitForConfirmation(signature, ambiguous ? Math.min(ambiguousWaitSec, confirmSec) : confirmSec);
           if (conf.confirmed) return landed(signature, amountRaw);
           if (conf.err) {
             maybeLanded = false; // definite on-chain failure
             noteComputeFailure(signature, conf.err);
             warn(`[Main] Sell tx ${signature} for ${shortId(pos.id)} FAILED on-chain: ${explainTxError(conf.err, pos.pool || pos.venue)}`);
           } else {
-            warn(`[Main] Sell tx ${signature} for ${shortId(pos.id)} not confirmed within ${config.CONFIRM_TIMEOUT_SEC}s.`);
+            warn(`[Main] Sell tx ${signature} for ${shortId(pos.id)} not confirmed within ${confirmSec}s.`);
           }
         } catch (err) {
-          warn(`[Main] Sell attempt ${attempt}/${config.SELL_MAX_ATTEMPTS} for ${shortId(pos.id)} failed: ${err.message}`);
+          warn(`[Main] Sell attempt ${attempt}/${maxAttempts} for ${shortId(pos.id)} failed: ${err.message}`);
         }
-        if (attempt < config.SELL_MAX_ATTEMPTS) await sleep(config.SELL_RETRY_DELAY_MS);
+        if (attempt < maxAttempts) await sleep(config.SELL_RETRY_DELAY_MS);
       }
       // The last attempt's fate may still be open: one more look before
       // reporting failure, so the retry after the cooldown can't sell twice.
@@ -984,7 +1000,7 @@ process.on('uncaughtException', (err) => {
     }
 
     /** Sell 100% of a position. Caller must hold the mint's exclusive lock. */
-    async function closeInner(live, reason, { persistIntent, alreadySent = null }) {
+    async function closeInner(live, reason, { persistIntent, alreadySent = null, sell = {} }) {
       // For exits that have no natural re-trigger (copy-sells, Telegram),
       // remember the intent so a failed sell is retried after the cooldown —
       // and still retried after a restart.
@@ -1013,13 +1029,16 @@ process.on('uncaughtException', (err) => {
         full: true,
         trackedKnown,
         alreadySent,
+        cheap: Boolean(sell.cheap),
+        ...(sell.maxAttempts ? { maxAttempts: sell.maxAttempts } : {}),
+        ...(sell.confirmSec ? { confirmSec: sell.confirmSec } : {}),
         stopIf: isCopyExit(reason) ? () => Boolean(live.keep) : null
       });
       if (res.stopped) {
         if (live.pending_exit) persist(live, { pending_exit: null });
         return { ok: false, message: 'Stopped: you tapped Keep.' };
       }
-      if (!res.ok) return failSell(live, reason);
+      if (!res.ok) return sell.quietFail ? { ok: false, message: 'the sell did not confirm' } : failSell(live, reason);
 
       const costSold = num(live.cost_basis_sol ?? live.buy_amount);
       const swapCostSold = num(live.swap_cost_sol ?? live.cost_basis_sol ?? live.buy_amount);
@@ -1034,11 +1053,12 @@ process.on('uncaughtException', (err) => {
       markClosed(live, { close_reason: reason, token_amount: '0', cost_basis_sol: 0, swap_cost_sol: 0, close_signature: res.signature });
       info(`[Main] Position ${shortId(live.id)} (${live.mint}) closed via ${reason}: https://solscan.io/tx/${res.signature}`);
 
-      const pnlSol = await reportSellPnl(live, reason, 100, { costSold, swapCostSold }, res, priorRealized);
+      const pnlSol = await reportSellPnl(live, reason, 100, { costSold, swapCostSold }, res, priorRealized, { quiet: Boolean(sell.quiet) });
       if (pnlSol !== null) storage.updatePosition(live.id, { realized_pnl_sol: priorRealized + pnlSol });
 
       return {
         ok: true,
+        pnlSol,
         message: `Sold ${shortMint(live.mint)} (${reason})` + (pnlSol !== null ? `, PnL ${fmtSigned(pnlSol, 4)} SOL` : '')
       };
     }
@@ -1049,7 +1069,7 @@ process.on('uncaughtException', (err) => {
      * closed while its tokens are still in the wallet.
      * Caller must hold the mint's exclusive lock (runExclusive).
      */
-    async function closePosition(pos, reason, { persistIntent = false, alreadySent = null } = {}) {
+    async function closePosition(pos, reason, { persistIntent = false, alreadySent = null, sell = {} } = {}) {
       const live = activeMap.get(pos.id);
       if (!live || live.status !== 'active') {
         info(`[Main] Position ${shortId(pos.id)} is already closed; skipping ${reason}.`);
@@ -1065,7 +1085,7 @@ process.on('uncaughtException', (err) => {
       }
       closingSet.add(live.id);
       try {
-        return await tracked(() => closeInner(live, reason, { persistIntent, alreadySent }));
+        return await tracked(() => closeInner(live, reason, { persistIntent, alreadySent, sell }));
       } catch (err) {
         return failSell(live, reason, err.message);
       } finally {
@@ -1080,7 +1100,8 @@ process.on('uncaughtException', (err) => {
      * forever. A partial sell that fails is remembered (pending_sell_pct)
      * and retried by the polling loop. Caller must hold the mint's lock.
      */
-    async function partialSell(pos, pct, reason, { isRetry = false, rememberFailure = true } = {}) {
+    async function partialSell(pos, pct, reason, { isRetry = false, rememberFailure = true, alreadySent = null, sell = {} } = {}) {
+      // sell: { cheap, quiet, quietFail, maxAttempts, confirmSec } for a DCA_SELLING part (see dcaRun).
       // rememberFailure=false (manual Telegram sells): a failed sell is
       // reported but NOT queued for automatic retry — you decide whether to
       // tap again.
@@ -1115,6 +1136,7 @@ process.on('uncaughtException', (err) => {
           }
 
           const trackedRaw = uiToRaw(live.token_amount, decimals);
+          if (sell.cheap && pct >= 99.99) return closeInner(live, reason, { persistIntent: true, sell });
           const sellRaw = rawPercent(trackedRaw, pct);
           if (sellRaw <= 0n) {
             info(`[Main] ${pct.toFixed(2)}% of position ${shortId(live.id)} rounds to zero tokens; nothing to sell.`);
@@ -1123,7 +1145,7 @@ process.on('uncaughtException', (err) => {
           }
           if ((trackedRaw - sellRaw) * 1000n <= trackedRaw) {
             info(`[Main] Selling ${pct.toFixed(2)}% would leave dust; closing position ${shortId(live.id)} fully instead.`);
-            return closeInner(live, `${reason} (remainder was dust)`, { persistIntent: true });
+            return closeInner(live, `${reason} (remainder was dust)`, { persistIntent: true, sell });
           }
 
           info(
@@ -1131,10 +1153,15 @@ process.on('uncaughtException', (err) => {
           );
           const res = await sellWithRetries(live, sellRaw, decimals, {
             full: false,
+            alreadySent,
+            cheap: Boolean(sell.cheap),
+            ...(sell.maxAttempts ? { maxAttempts: sell.maxAttempts } : {}),
+            ...(sell.confirmSec ? { confirmSec: sell.confirmSec } : {}),
             stopIf: isCopyExit(reason) ? () => Boolean(live.keep) : null
           });
           if (res.stopped) return { ok: false, message: 'Stopped: you tapped Keep.' };
           if (!res.ok) {
+            if (sell.quietFail) return { ok: false, message: 'the sell did not confirm' };
             if (remember) {
               // Combine with any earlier failed partial: remaining fractions multiply.
               const remaining = (1 - num(live.pending_sell_pct) / 100) * (1 - pct / 100);
@@ -1175,10 +1202,10 @@ process.on('uncaughtException', (err) => {
               `(https://solscan.io/tx/${res.signature}); ${rawToUi(remainingRaw, decimals)} tokens remain.`
           );
 
-          const pnlSol = await reportSellPnl(live, reason, soldPct, { costSold, swapCostSold }, res, priorRealized);
+          const pnlSol = await reportSellPnl(live, reason, soldPct, { costSold, swapCostSold }, res, priorRealized, { quiet: Boolean(sell.quiet) });
           if (pnlSol !== null) storage.updatePosition(live.id, { realized_pnl_sol: priorRealized + pnlSol });
           if (pnlSol !== null && !remainderIsDust) live.realized_pnl_sol = priorRealized + pnlSol;
-          return { ok: true, message: `Sold ${soldPct.toFixed(2)}% of position ${shortId(live.id)}.` };
+          return { ok: true, pnlSol, message: `Sold ${soldPct.toFixed(2)}% of position ${shortId(live.id)}.` };
         });
       } catch (err) {
         // e.g. an RPC error reading the balance: remember the sell like any
@@ -1187,6 +1214,7 @@ process.on('uncaughtException', (err) => {
           const remaining = (1 - num(live.pending_sell_pct) / 100) * (1 - pct / 100);
           persist(live, { pending_sell_pct: (1 - remaining) * 100 });
         }
+        if (sell.quietFail) return { ok: false, message: err.message };
         return failSell(live, reason, err.message, { noRetry: !remember });
       } finally {
         closingSet.delete(live.id);
@@ -1303,7 +1331,7 @@ process.on('uncaughtException', (err) => {
       };
     }
 
-    async function sendInstantSell({ mint, dex, venue, pool, buySig, landedAt, knownRaw = null, knownDecimals = null }) {
+    async function sendInstantSell({ mint, dex, venue, pool, buySig, landedAt, knownRaw = null, knownDecimals = null, firstPct = 100 }) {
       if (config.INSTANT_SELL_DELAY_MS > 0) await sleep(config.INSTANT_SELL_DELAY_MS);
       // The amount pushed with the landing (watchOwnTokens) needs no read.
       // Otherwise read it: a node a moment behind the one that reported the
@@ -1324,10 +1352,13 @@ process.on('uncaughtException', (err) => {
         warn(`[Main] INSTANT_SELL: the tokens from buy ${buySig.slice(0, 8)}… aren't visible yet; selling them as soon as the buy is confirmed instead.`);
         return null;
       }
+      // DCA_SELLING: only the first part (DCA_FIRST_PCT %) goes out now; the rest follows in slices.
+      const sellRaw = firstPct < 100 ? rawPercent(bal.raw, firstPct) : bal.raw;
+      if (!(sellRaw > 0n)) return null;
       try {
         const signature = await sellToken({
           mint,
-          amountTokens: rawToUi(bal.raw, bal.decimals),
+          amountTokens: rawToUi(sellRaw, bal.decimals),
           slippage: config.SLIPPAGE,
           tip: config.JITO_TIP,
           dex,
@@ -1335,12 +1366,12 @@ process.on('uncaughtException', (err) => {
           pool: pool || null,
           warm: true
         });
-        info(`[Main] INSTANT_SELL: sell of ${mint} sent ${Date.now() - landedAt}ms after the buy was seen landed: https://solscan.io/tx/${signature}`);
-        return { signature, amountRaw: bal.raw };
+        info(`[Main] INSTANT_SELL: ${firstPct < 100 ? `first ${firstPct}% of ${mint}` : `sell of ${mint}`} sent ${Date.now() - landedAt}ms after the buy was seen landed: https://solscan.io/tx/${signature}`);
+        return { signature, amountRaw: sellRaw };
       } catch (err) {
         if (err && err.txSignature) {
           warn(`[Main] INSTANT_SELL: sell send outcome unknown (${err.message}); following ${err.txSignature}.`);
-          return { signature: err.txSignature, amountRaw: bal.raw, ambiguous: true };
+          return { signature: err.txSignature, amountRaw: sellRaw, ambiguous: true };
         }
         warn(`[Main] INSTANT_SELL: the sell couldn't be sent (${err.message}); retrying once the buy is recorded.`);
         return null;
@@ -1388,6 +1419,122 @@ process.on('uncaughtException', (err) => {
           return { ok: false, message: err.message };
         })
         .finally(() => queuedSells.delete(pos.id));
+    }
+
+
+    // === DCA_SELLING: a position sold in parts ===
+    // The first part (DCA_FIRST_PCT %) goes out as the instant sell. The rest follows
+    // in DCA_SLICES slices spread evenly over DCA_SECONDS, each through Jito with the
+    // small DCA_TIP / DCA_PRIORITY_FEE_SOL. A slice is tried once (DCA_CONFIRM_SEC);
+    // if one fails, or the copy wallet sells, the rest is sold at once the usual fast way.
+    const dcaRuns = new Map(); // position id -> { cancelled, reason, wake, done, pnl, cost, parts }
+
+    /** Stop the slices of a position. With a `reason`, its rest is then sold at once. Returns the run, or null. */
+    function dcaStop(pos, reason) {
+      const run = dcaRuns.get(pos.id);
+      if (!run) return null;
+      run.cancelled = true;
+      if (reason) run.reason = reason;
+      if (run.wake) run.wake();
+      return run;
+    }
+
+    function requestSlice(live, pct, label) {
+      queuedSells.add(live.id);
+      return tracked(() =>
+        runExclusive(live.mint, () =>
+          partialSell(live, pct, label, {
+            rememberFailure: false,
+            sell: { cheap: true, quiet: true, quietFail: true, maxAttempts: 1, confirmSec: config.DCA_CONFIRM_SEC }
+          })
+        )
+      )
+        .catch((err) => ({ ok: false, message: err.message }))
+        .finally(() => queuedSells.delete(live.id));
+    }
+
+    /** Called with the lock held, once the first part is on its way (`early`). Starts the slices in the background. */
+    async function dcaBegin(pos, early, mode) {
+      const total = config.DCA_SLICES;
+      const run = { pos, cancelled: false, reason: null, wake: null, pnl: 0, pnlKnown: false, cost: num(pos.cost_basis_sol ?? pos.buy_amount), parts: 1, done: null };
+      let finish;
+      run.done = new Promise((r) => { finish = r; });
+      dcaRuns.set(pos.id, run);
+      persist(pos, { dca: { mode, total, startedAt: Date.now() } });
+      info(`[Main] DCA_SELLING (${dcaSell.label(mode)}): ${dcaSell.firstPct()}% first, then ${total} slices over ${config.DCA_SECONDS}s (${dcaSell.plan(mode).map((x) => x.toFixed(1)).join(' / ')}% of the original).`);
+      const first = await partialSell(pos, dcaSell.firstPct(), 'INSTANT_SELL (DCA first part)', {
+        rememberFailure: false,
+        alreadySent: early,
+        sell: { quiet: true, quietFail: true }
+      });
+      const live = activeMap.get(pos.id);
+      if (first && first.pnlSol != null) { run.pnl += first.pnlSol; run.pnlKnown = true; }
+      if (!first || !first.ok || !live || live.status !== 'active') {
+        dcaRuns.delete(pos.id);
+        finish();
+        if (live && live.status === 'active') {
+          persist(live, { dca: null });
+          warn(`[Main] DCA_SELLING: the first part of ${shortId(pos.id)} did not go through; selling all of it the usual way.`);
+          await closePosition(live, 'INSTANT_SELL (DCA first part failed)', { persistIntent: true });
+        }
+        return;
+      }
+      dcaRun(live.id, run, mode, finish).catch((err) => error(`[Main] DCA_SELLING runner for ${shortId(pos.id)} failed unexpectedly:`, err.message));
+    }
+
+    async function dcaRun(id, run, mode, finish) {
+      const total = config.DCA_SLICES;
+      const t0 = Date.now();
+      let failed = false;
+      let done = 0;
+      try {
+        for (let i = 1; i <= total; i++) {
+          const wait = t0 + dcaSell.offsetMs(i, total) - Date.now();
+          if (wait > 0) {
+            await new Promise((resolve) => {
+              const t = setTimeout(resolve, wait);
+              run.wake = () => { clearTimeout(t); resolve(); };
+            });
+            run.wake = null;
+          }
+          if (run.cancelled) break;
+          const live = activeMap.get(id);
+          if (!live || live.status !== 'active') break;
+          const res = await requestSlice(live, dcaSell.slicePct(mode, i, total), `DCA part ${i + 1}/${total + 1}`);
+          if (res && res.pnlSol != null) { run.pnl += res.pnlSol; run.pnlKnown = true; }
+          if (res && res.ok) { run.parts += 1; done = i; }
+          if (run.cancelled) break;
+          if (!res || !res.ok) { failed = true; warn(`[Main] DCA_SELLING: slice ${i}/${total} of ${shortId(id)} failed (${res ? res.message : 'unknown'}).`); break; }
+        }
+      } catch (err) {
+        failed = true;
+        warn(`[Main] DCA_SELLING: ${err.message}`);
+      }
+      dcaRuns.delete(id);
+      const live = activeMap.get(id);
+      try {
+        if (!live || live.status !== 'active') {
+          try { storage.updatePosition(id, { dca: null }); } catch {}
+          // All sold: one summary instead of a message per slice.
+          info(`[Main][PnL] DCA_SELLING: sold in ${run.parts} part(s) over ${((Date.now() - t0) / 1000).toFixed(0)}s${run.pnlKnown ? `; PnL ${fmtSigned(run.pnl, 4)} SOL` : ''}.`);
+          const pos = live || run.pos;
+          if (pos && run.pnlKnown && run.cost > 0) {
+            telegramBot.notifySell({ pos, reason: `DCA sell in ${run.parts} parts`, soldPct: 100, pnlSol: run.pnl, pnlPct: (run.pnl / run.cost) * 100, realized: true });
+          }
+          return;
+        }
+        persist(live, { dca: null });
+        if (run.cancelled && !run.reason) {
+          info(`[Main] DCA_SELLING: slices of ${shortId(id)} stopped; the rest stays open.`);
+          return;
+        }
+        const reason = run.reason || 'DCA (a slice failed): selling the rest';
+        if (failed) persist(live, { needs_reconcile: true }); // a slice that did not confirm may still land: read the balance first
+        info(`[Main] DCA_SELLING: ${reason}; selling the rest of ${shortId(id)} now.`);
+        closeOrRemember(live, reason);
+      } finally {
+        finish();
+      }
     }
 
     const PRICE_SAVE_EVERY_MS = 5000;
@@ -2055,6 +2202,8 @@ process.on('uncaughtException', (err) => {
         // INSTANT_SELL: sold the moment the buy lands (an add-on to a coin
         // already held is left to that position's own exits).
         const instant = config.INSTANT_SELL && activeByMint(mint).length === 0;
+        // DCA_SELLING in force when this buy goes out ('even' | 'left'), or null for the usual whole-position instant sell.
+        const dcaMode = instant && dcaSell.active() ? dcaSell.mode() : null;
         let instantSell = null; // Promise<{ signature, amountRaw, ambiguous } | null>
         // Whichever notices first: our tokens arriving (pushed), or the
         // buy's status (polled every 50 ms).
@@ -2072,7 +2221,7 @@ process.on('uncaughtException', (err) => {
           );
           // Every Pump.fun coin has 6 decimals; other venues read them.
           const knownDecimals = knownRaw !== null && venue === 'pumpfun' ? 6 : null;
-          instantSell = sendInstantSell({ mint, dex: portalDex, venue, pool, buySig, landedAt, knownRaw: knownDecimals !== null ? knownRaw : null, knownDecimals }).catch((err) => {
+          instantSell = sendInstantSell({ mint, dex: portalDex, venue, pool, buySig, landedAt, knownRaw: knownDecimals !== null ? knownRaw : null, knownDecimals, firstPct: dcaMode ? dcaSell.firstPct() : 100 }).catch((err) => {
             warn(`[Main] INSTANT_SELL failed unexpectedly: ${err.message}`);
             return null;
           });
@@ -2308,7 +2457,8 @@ process.on('uncaughtException', (err) => {
         if (instant && !added) {
           const early = instantSell ? await instantSell : null;
           if (!early) info(`[Main] INSTANT_SELL: selling position ${shortId(pos.id)} now.`);
-          await closePosition(pos, 'INSTANT_SELL', { persistIntent: true, alreadySent: early });
+          if (dcaMode && early) await dcaBegin(pos, early, dcaMode);
+          else await closePosition(pos, 'INSTANT_SELL', { persistIntent: true, alreadySent: early });
         } else if (remainingFrac < 1 && pos.trade_mode === 'STIERED' && config.FULL_EXIT_ON_COPY_SELL && !pos.keep) {
           info(`[Main] Copy wallet already sold some of ${mint} before our buy landed; FULL_EXIT_ON_COPY_SELL is on, so selling all of it.`);
           await closePosition(pos, 'STIERED copy-sell (processed before buy, full exit)', { persistIntent: true });
@@ -2370,6 +2520,11 @@ process.on('uncaughtException', (err) => {
           const msg = `Copy wallet ${moved} ${pct.toFixed(0)}% of ${mint}; not following, you're keeping position ${shortId(pos.id)}.`;
           info(`[Main] ${msg}`);
           telegramBot.notifyInfo(`📌 Copy wallet ${moved} ${pct.toFixed(0)}% of ${mint.slice(0, 4)}...${mint.slice(-4)}. You're keeping your position; sell with the buttons when ready.`);
+          continue;
+        }
+        // Sold in parts (DCA_SELLING): the slices stop and everything left goes at once, the usual fast way.
+        if (dcaStop(pos, `STIERED ${what} (DCA stopped, selling the rest)`)) {
+          info(`[Main] Copy wallet${who(wallet)} ${moved} ${pct.toFixed(0)}% of ${mint}; stopping the DCA slices of ${shortId(pos.id)} and selling the rest now.`);
           continue;
         }
         if (pos.trade_mode === 'EXACT') {
@@ -2905,6 +3060,10 @@ process.on('uncaughtException', (err) => {
         if (shuttingDown) return { ok: false, message: 'The bot is shutting down.' };
         const pos = activeMap.get(id);
         if (!pos) return { ok: false, message: 'That position is already closed.' };
+        // A position sold in parts (DCA_SELLING): the slices stop (a slice already on its way finishes first), then this sell runs.
+        const dcaRunning = dcaStop(pos, null);
+        if (dcaRunning) await dcaRunning.done;
+        if (!activeMap.has(pos.id)) return { ok: false, message: 'That position is already closed.' };
         if (pct >= 100) return requestClose(pos, 'Telegram manual sell', { persistIntent: true });
         return requestPartial(pos, pct, `Telegram manual sell (${pct}%)`, { rememberFailure: false });
       },
@@ -2916,6 +3075,7 @@ process.on('uncaughtException', (err) => {
         const pos = activeMap.get(id);
         if (!pos) return { ok: false, message: 'That position is already closed.' };
         const updates = { keep: Boolean(keep) };
+        if (keep) dcaStop(pos, null); // Keep: the slices stop, the rest stays open
         if (keep) {
           if (pos.pending_exit && /copy-(sell|transfer)/.test(pos.pending_exit)) updates.pending_exit = null;
           if (num(pos.pending_sell_pct) > 0) updates.pending_sell_pct = null;
@@ -2926,6 +3086,13 @@ process.on('uncaughtException', (err) => {
       },
       requestStop: () => gracefulShutdown('Telegram /stop'),
       isPaused: () => paused,
+      getDcaMode: () => dcaSell.mode(),
+      setDcaMode: (m) => {
+        if (!dcaSell.setMode(m)) return false;
+        storage.setDcaMode(dcaSell.mode());
+        info(`[Main] Selling mode set from Telegram: ${dcaSell.label()}${dcaSell.mode() !== 'instant' && !config.INSTANT_SELL ? ' (INSTANT_SELL is off, so it has no effect)' : ''}.`);
+        return true;
+      },
       setPaused: (value) => {
         if (config.REHEARSE_ONLY) {
           info('[Main] Resume ignored: REHEARSE_ONLY is on, this bot never buys.');
@@ -2942,6 +3109,8 @@ process.on('uncaughtException', (err) => {
       closeAllPositions: async () => {
         if (shuttingDown) throw new Error('The bot is shutting down.');
         const positions = Array.from(activeMap.values()).filter((p) => p.status === 'active');
+        // Positions sold in parts (DCA_SELLING): their slices stop and the rest is sold at once.
+        for (const pos of positions) dcaStop(pos, 'Telegram close all');
         // A position with a sell already running is sold right after it.
         const busy = positions.filter((p) => isBusy(p.id));
         for (const pos of busy) closeOrRemember(pos, 'Telegram close all');

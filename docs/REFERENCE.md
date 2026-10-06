@@ -844,3 +844,17 @@ Licensed under the MIT License. Based on [ahk780/solana-copy-trading-bot](https:
 
 **Where your Helius credits go (`[Usage]` log lines).** Every `USAGE_LOG_MIN` minutes (default 10) and at shutdown the bot logs the RPC calls by method and the trade-detection websocket's data, with an estimate of credits (1 per call, about 20 per MB of websocket data), followed by a second line splitting the websocket data **by copy wallet** (share of the MB, credits per day at that rate, and how many of its messages were transactions it signed, transactions someone else signed that merely mention it, or failed ones). With `DETECTION_FEED="transaction"` every transaction that mentions a copy wallet is delivered whole (about 4-6 KB), including airdrops, dust and other bots' transactions; there is no server-side filter for "signed by", so a busy wallet costs credits whether or not it trades.
 
+
+
+**Selling in parts (`DCA_SELLING`).** With `INSTANT_SELL` on, a position is normally sold whole the moment its buy lands. `DCA_SELLING="DCA_even"` or `"DCA_left"` (or `/dca even`, `/dca left` in Telegram; `/dca instant` goes back) sells it in parts instead:
+
+- **Part 1** is the usual instant sell (Sender, same speed) but only `DCA_FIRST_PCT` % (default 25) of the tokens.
+- **DCA_even:** the rest is sold in `DCA_SLICES` (default 9) equal slices, spread evenly over `DCA_SECONDS` (default 15) after part 1 lands. With the defaults: 25% then nine slices of 8.33%.
+- **DCA_left:** each slice sells `DCA_LEFT_PCT` % (default 25) of what is left; the last slice sells all that remains, so nothing is left behind. With the defaults: 25%, 18.75%, 14.06%, 10.55%, 7.91% ... and a final slice of about 7.5% (of the original).
+- **Slices are cheap on purpose.** They go through Jito, not Sender, with the tip `DCA_TIP` (default 0.000001 SOL, Jito's minimum) and total priority fee `DCA_PRIORITY_FEE_SOL` (default 0), and each is tried once, waiting up to `DCA_CONFIRM_SEC` (8 s). Besides those, each transaction pays Solana's base fee of 5,000 lamports (0.000005 SOL) per signature. A slice at these fees can land a block or two late, or occasionally not at all.
+- **If a slice fails or is not confirmed**, the slices stop and the rest is sold at once the usual fast way (Sender, `SELL_SENDER_TIP`, `PRIORITY_FEE_SOL`).
+- **If the copy wallet sells** (any sell, partial or full) while slices remain, the slices stop at once and everything left is sold the usual fast way. A slice that is already on its way finishes first (normally well under a second).
+- **A manual sell or Close all** in Telegram stops the slices and then does what you asked; **Keep** stops them and leaves the rest open.
+- **Restart:** a position that was being sold in parts when the bot stopped has its rest sold at once on startup.
+- **Telegram** gets one message per sell as usual for the first part, then a single summary when the parts are done instead of one per slice; the PnL adds up all parts.
+- The position stays open (and counts toward `MAX_OPEN_POSITIONS`) until the last slice, about `DCA_SECONDS` after the buy.

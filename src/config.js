@@ -567,6 +567,29 @@ if (!config.DIRECT_PUMPFUN_SWAP) {
 if ((process.env.INSTANT_SELL || '').trim() && !['true', 'false'].includes(process.env.INSTANT_SELL.trim())) {
   fail(`INSTANT_SELL must be "true" or "false" (got "${process.env.INSTANT_SELL}")`);
 }
+// DCA_SELLING: how the INSTANT_SELL sells a position. "instant" (default) sells
+// everything at once; "DCA_even" and "DCA_left" sell the first part at once and
+// the rest in slices over DCA_SECONDS (see dcaSell.js). Can be switched live
+// from Telegram (/dca); the value saved there wins over this file.
+{
+  const raw = (process.env.DCA_SELLING || 'instant').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  const modes = { instant: 'instant', dca_even: 'even', even: 'even', dca_left: 'left', left: 'left' };
+  if (!modes[raw]) fail(`DCA_SELLING must be "instant", "DCA_even" or "DCA_left" (got "${process.env.DCA_SELLING}")`);
+  config.DCA_SELLING = modes[raw];
+}
+config.DCA_SLICES = numEnv('DCA_SLICES', { def: 9, min: 1, max: 60, integer: true });
+config.DCA_SECONDS = numEnv('DCA_SECONDS', { def: 15, min: 1, max: 600 });
+config.DCA_FIRST_PCT = numEnv('DCA_FIRST_PCT', { def: 25, min: 1, max: 99 });
+config.DCA_LEFT_PCT = numEnv('DCA_LEFT_PCT', { def: 25, min: 1, max: 99 });
+config.DCA_TIP = numEnv('DCA_TIP', { def: 0.000001, min: 0 }); // SOL, Jito tip of a slice (Jito's minimum is 0.000001)
+config.DCA_PRIORITY_FEE_SOL = numEnv('DCA_PRIORITY_FEE_SOL', { def: 0, min: 0 }); // SOL, total priority fee of a slice
+config.DCA_CONFIRM_SEC = numEnv('DCA_CONFIRM_SEC', { def: 8, min: 1 });
+if (config.DCA_SELLING !== 'instant' && !config.INSTANT_SELL) {
+  console.warn('[config] WARNING: DCA_SELLING does nothing while INSTANT_SELL is off (it works on the instant sell).');
+}
+if (config.DCA_TIP > 0 && config.DCA_TIP < 0.000001) {
+  console.warn('[config] WARNING: DCA_TIP is below Jito\'s minimum tip of 0.000001 SOL; Jito may ignore the tip.');
+}
 if (config.INSTANT_SELL && config.SELL_AFTER_SECONDS > 0) {
   console.warn('[config] WARNING: INSTANT_SELL is on, so SELL_AFTER_SECONDS is ignored (every position is sold as soon as its buy lands).');
 }

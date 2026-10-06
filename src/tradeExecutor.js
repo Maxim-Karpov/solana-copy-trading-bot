@@ -122,10 +122,10 @@ function prepareAndSign(tx, opts = {}) {
   if (tx.handBuilt) {
     // Written for its route already (Sender's tip and fee, or Jito's).
     tx.sign(walletKeypair);
-    return { tx, viaSender: USE_SENDER, txSignature: bs58.encode(tx.signatures[0]) };
+    return { tx, viaSender: USE_SENDER && !opts.viaJito, txSignature: bs58.encode(tx.signatures[0]) };
   }
   let viaSender = false;
-  if (USE_SENDER) {
+  if (USE_SENDER && !opts.viaJito) {
     const prep = prepareForSender(tx, {
       tipLamports: senderTipFor(opts.side) * 1e9,
       priorityFeeLamports: feeSol * 1e9
@@ -318,7 +318,7 @@ function noteDirectMiss(mint, reason) {
   if (lastDirectMiss.size > 200) lastDirectMiss.delete(lastDirectMiss.keys().next().value);
 }
 
-async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, tip, venue, pool, curveHint = null, guardInstructions = null, fastHint = null, coinFilter = null, warm = false }) {
+async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, tip, venue, pool, curveHint = null, guardInstructions = null, fastHint = null, coinFilter = null, warm = false, cheap = false }) {
   let builder = null;
   let isUnsupported = null;
   let label = null;
@@ -362,11 +362,12 @@ async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, t
       user: walletPublicKey,
       mint,
       slippagePct: slippage,
-      tipSol: effectiveTip(tip, side)
+      // DCA_SELLING slices: Jito with the small DCA_TIP, whatever SEND_VIA says.
+      tipSol: cheap ? config.DCA_TIP : effectiveTip(tip, side)
     };
     const cuLimit = label === 'Pump.fun' ? PUMPFUN_CU_LIMIT : RAYDIUM_CU_LIMIT;
     args.computeUnitLimit = cuLimit;
-    const feeSol = priorityFeeSol(side, amountSol);
+    const feeSol = cheap ? config.DCA_PRIORITY_FEE_SOL : priorityFeeSol(side, amountSol);
     if (feeSol > 0) {
       // Total fee in lamports spread over the compute-unit limit, in micro-lamports per unit.
       args.priorityFeeMicroLamports = Math.ceil((feeSol * 1e9 * 1e6) / cuLimit);
@@ -415,9 +416,9 @@ async function tryBuildDirect(side, { mint, amountSol, amountTokens, slippage, t
  * no risk of a double trade. Once a transaction is sent, send errors go to
  * the caller as usual.
  */
-async function sendViaPortalOrJupiter(side, portalParams, buildJupiter) {
+async function sendViaPortalOrJupiter(side, portalParams, buildJupiter, { cheap = false } = {}) {
   const SIDE = side.toUpperCase();
-  const sendOpts = { feeSol: priorityFeeSol(side, portalParams && portalParams.amount), side };
+  const sendOpts = { feeSol: cheap ? config.DCA_PRIORITY_FEE_SOL : priorityFeeSol(side, portalParams && portalParams.amount), side, viaJito: cheap };
   const portalOn = config.USE_SOLANAPORTAL[side];
   const jupiterOn = config.JUPITER_FALLBACK[side];
   if (!portalOn) {
@@ -960,21 +961,21 @@ async function consolidatePlain(mint) {
   }
 }
 
-async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool = null, warm = false }) {
+async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool = null, warm = false, cheap = false }) {
   const route = venue || dex;
   info(
     `[tradeExecutor] Placing SELL order: mint=${mint}, tokenAmount=${amountTokens}, ` +
-      `dex=${dex}, venue=${route}, slippage=${slippage}%, tip=${effectiveTip(tip, 'sell')} SOL via ${USE_SENDER ? 'Helius Sender' : 'Jito'}`
+      `dex=${dex}, venue=${route}, slippage=${slippage}%, tip=${cheap ? config.DCA_TIP : effectiveTip(tip, 'sell')} SOL via ${cheap ? 'Jito (DCA slice)' : USE_SENDER ? 'Helius Sender' : 'Jito'}`
   );
 
   const t0 = Date.now();
-  const directTx = await tryBuildDirect('sell', { mint, amountTokens, slippage, tip, venue: route, pool, warm });
+  const directTx = await tryBuildDirect('sell', { mint, amountTokens, slippage, tip, venue: route, pool, warm, cheap });
   if (directTx) {
     const builtMs = Date.now() - t0;
     const qt = directTx.tx.quoteTrade || null;
     let signature;
     try {
-      signature = await signAndSendTx(directTx.tx, { side: 'sell' });
+      signature = await signAndSendTx(directTx.tx, { side: 'sell', viaJito: cheap });
     } catch (err) {
       if (err && err.txSignature) rememberQuoteTrade(err.txSignature, qt);
       if (err && err.txSignature) rememberCompute(err.txSignature, directTx.tx);
@@ -1000,12 +1001,12 @@ async function sellToken({ mint, amountTokens, slippage, tip, dex, venue, pool =
     amount: amountTokens,
     slippage,
     // Via Sender, the portal's Jito tip is redirected to Sender (and needs Sender's amount).
-    tip: effectiveTip(tip, 'sell'),
+    tip: cheap ? config.DCA_TIP : effectiveTip(tip, 'sell'),
     type: 'jito'
   };
   return sendViaPortalOrJupiter('sell', params, () =>
-    buildJupiterSellTx({ user: walletPublicKey, mint, tokenAmountUi: amountTokens, slippagePct: slippage, tipSol: effectiveTip(tip, 'sell') })
-  );
+    buildJupiterSellTx({ user: walletPublicKey, mint, tokenAmountUi: amountTokens, slippagePct: slippage, tipSol: cheap ? config.DCA_TIP : effectiveTip(tip, 'sell') })
+  , { cheap });
 }
 
 /** Buy `amountSol` SOL of a token via Jupiter (QUOTE_TOKENS reserves). Returns the signature. */

@@ -1139,6 +1139,33 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(gap >= 700 && gap < 1000, `RPC_MAX_RPS=1.33: 750 ms apart (got ${gap})`);
   });
 
+  await test('dcaSell: plans, slice sizes and timing', async () => {
+    const d = require(src('dcaSell.js'));
+    const cfg = require(src('config.js'));
+    const saved = { m: cfg.DCA_SELLING, i: cfg.INSTANT_SELL };
+    try {
+      cfg.INSTANT_SELL = true;
+      check(d.setMode('DCA_even') && d.mode() === 'even' && d.active(), 'DCA_even accepted');
+      check(d.setMode('DCA_left') && d.mode() === 'left', 'DCA_left accepted');
+      check(d.setMode('instant') && !d.active(), 'instant is the usual sell');
+      check(!d.setMode('bogus'), 'unknown mode refused');
+      const even = d.plan('even', 9, 25, 25);
+      check(even.length === 10 && Math.abs(even[0] - 25) < 1e-9 && even.slice(1).every((x) => Math.abs(x - 75 / 9) < 1e-9), `even: 25% then nine of ${(75 / 9).toFixed(2)}% (${even.map((x) => x.toFixed(2))})`);
+      check(Math.abs(even.reduce((a, b) => a + b, 0) - 100) < 1e-9, 'even plan adds up to 100%');
+      const left = d.plan('left', 9, 25, 25);
+      check(Math.abs(left[1] - 18.75) < 1e-9 && Math.abs(left[2] - 14.0625) < 1e-9, 'left: 25% of what is left each time');
+      check(Math.abs(left.reduce((a, b) => a + b, 0) - 100) < 1e-9 && left[9] > left[8], 'left plan sells everything, the last slice takes the rest');
+      check(d.slicePct('even', 9, 9) === 100 && d.slicePct('left', 9, 9) === 100, 'the last slice sells all that is left');
+      check(d.offsetMs(9, 9, 15) === 15000 && d.offsetMs(1, 9, 15) === 1667, 'slices spread evenly over 15 s');
+      cfg.INSTANT_SELL = false;
+      d.setMode('left');
+      check(!d.active(), 'needs INSTANT_SELL');
+    } finally {
+      cfg.DCA_SELLING = saved.m;
+      cfg.INSTANT_SELL = saved.i;
+    }
+  });
+
   await test('usageStats: counts calls and websocket data, estimates credits', async () => {
     const usage = require(src('usageStats.js'));
     usage.countRpc('getTransaction'); usage.countRpc('getTransaction'); usage.countRpc('getBalance');
@@ -3725,6 +3752,43 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(own.buy === 1600000 && own.sell === 1000000, `buy tips SENDER_TIP, sell tips SELL_SENDER_TIP (${JSON.stringify(own)})`);
     const dflt = run({});
     check(dflt.buy === 1600000 && dflt.sell === 1600000, `without SELL_SENDER_TIP sells tip SENDER_TIP as before (${JSON.stringify(dflt)})`);
+  });
+
+  await test('DCA slices: sent through Jito with their own small tip even when SEND_VIA is sender', async () => {
+    const script = `
+      const path = require('path');
+      const src = (f) => path.join(process.cwd(), 'src', f);
+      const { Keypair, SystemProgram, TransactionMessage, VersionedTransaction } = require('@solana/web3.js');
+      const bs58m = require('bs58'); const bs58 = bs58m.default || bs58m;
+      let sentTx = null, url = null;
+      globalThis.fetch = async (u, opts) => {
+        url = String(u);
+        sentTx = VersionedTransaction.deserialize(Buffer.from(JSON.parse(opts.body).params[0], 'base64'));
+        return { ok: true, status: 200, statusText: 'OK', text: async () => JSON.stringify({ jsonrpc: '2.0', id: '1', result: bs58.encode(sentTx.signatures[0]) }) };
+      };
+      const { JITO_TIP_ACCOUNTS } = require(src('jitoTip.js'));
+      const config = require(src('config.js'));
+      const payer = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
+      const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: '11111111111111111111111111111111',
+        instructions: [SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: JITO_TIP_ACCOUNTS[0], lamports: 1000 })] }).compileToV0Message();
+      const te = require(src('tradeExecutor.js'));
+      (async () => {
+        const out = {};
+        for (const [name, opts] of [['usual', { feeSol: 0.0001, side: 'sell' }], ['slice', { feeSol: 0, side: 'sell', viaJito: true }]]) {
+          await te.signAndSendTx(new VersionedTransaction(msg), opts);
+          const k = sentTx.message.staticAccountKeys.map(String);
+          const ix = sentTx.message.compiledInstructions.find((c) => k[c.programIdIndex] === '11111111111111111111111111111111');
+          out[name] = { tip: Number(Buffer.from(ix.data).readBigUInt64LE(4)), jito: url === config.JITO_ENGINE };
+        }
+        console.log(JSON.stringify(out));
+        process.exit(0);
+      })().catch((e) => { console.log(JSON.stringify({ error: e.message })); process.exit(0); });
+    `;
+    const r = spawnSync(process.execPath, ['-e', script], { cwd: root, encoding: 'utf8', env: { ...process.env, SEND_VIA: 'sender', SENDER_TIP: '0.0016' } });
+    let out;
+    try { out = JSON.parse((r.stdout || '').trim().split('\n').reverse().find((l) => l.startsWith('{'))); } catch { out = { error: (r.stderr || r.stdout || '').slice(-300) }; }
+    check(out.usual && out.usual.tip === 1600000 && !out.usual.jito, `a usual sell goes to Sender with its tip (${JSON.stringify(out)})`);
+    check(out.slice && out.slice.tip === 1000 && out.slice.jito, `a slice keeps its small tip and goes to Jito (${JSON.stringify(out)})`);
   });
 
   await test('on-chain errors: ProgramFailedToComplete explained as a likely compute shortfall', async () => {

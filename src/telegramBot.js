@@ -31,6 +31,8 @@ let requestStop = null; // injected by index.js via init()
 let closeAllPositions = null; // injected by index.js via init()
 let isPaused = () => false; // injected by index.js via init()
 let setPaused = null; // injected by index.js via init()
+let getDcaMode = null; // DCA_SELLING mode: () => 'instant' | 'even' | 'left' (injected)
+let setDcaMode = null; // (mode) => boolean (injected)
 let setKeep = null; // injected by index.js via init()
 const FOLLOWS_COPY_SELLS = new Set(['EXACT', 'STIERED']);
 let lastOffset = 0; // next update_id to ask Telegram for (= everything before it handled)
@@ -153,6 +155,8 @@ function init(deps) {
   isPaused = deps.isPaused || (() => false);
   setPaused = deps.setPaused || null;
   setKeep = deps.setKeep || null;
+  getDcaMode = deps.getDcaMode || null;
+  setDcaMode = deps.setDcaMode || null;
 
   if (!isEnabled()) {
     info('[TelegramBot] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; Telegram control bot disabled.');
@@ -170,6 +174,7 @@ function init(deps) {
       { command: 'positions', description: 'Open positions with sell buttons' },
       { command: 'pause', description: 'Pause new buys (exits keep working)' },
       { command: 'resume', description: 'Resume copying buys' },
+      { command: 'dca', description: 'How positions are sold: instant, DCA even or DCA left' },
       { command: 'stop', description: 'Stop the bot (positions are not sold)' },
       { command: 'help', description: 'List commands' }
     ]
@@ -233,6 +238,8 @@ async function handleUpdate(update) {
       await changePause(msg.chat.id, true);
     } else if (/^\/resume\b/.test(msg.text)) {
       await changePause(msg.chat.id, false);
+    } else if (/^\/dca\b/.test(msg.text)) {
+      await changeDca(msg.chat.id, msg.text.replace(/^\/dca(@\S+)?/i, '').trim());
     } else if (/^\/stop\b/.test(msg.text)) {
       await sendStopConfirmation(msg.chat.id);
     } else if (/^\/help\b/.test(msg.text)) {
@@ -249,10 +256,44 @@ const HELP_TEXT =
   '/positions — open positions with Sell 50% / Sell all buttons (also sent after every buy)\n' +
   '/pause — stop copying new buys (exits and sell buttons keep working)\n' +
   '/resume — start copying buys again\n' +
+  '/dca — how positions are sold: /dca instant, /dca even (instant part, then equal slices), /dca left (25% of what is left each time)\n' +
   '/stop — stop the bot (asks to confirm; open positions are NOT sold)\n' +
   '/help — this list';
 
 const PAUSED_NOTE = 'Copy-sells, Sell buttons and Close all still work, so open positions can always be exited.';
+
+const DCA_NAMES = { instant: '⚡ instant', even: '🧩 DCA even', left: '🧩 DCA left' };
+
+/** /dca (show) or /dca instant|even|left (set). */
+async function changeDca(chatId, arg) {
+  if (!getDcaMode || !setDcaMode) {
+    await send(chatId, 'DCA selling is not available.');
+    return;
+  }
+  if (arg) {
+    if (!setDcaMode(arg)) {
+      await send(chatId, 'Use /dca instant, /dca even or /dca left.');
+      return;
+    }
+  }
+  const m = getDcaMode();
+  await send(
+    chatId,
+    `Selling: ${DCA_NAMES[m]}.\n` +
+      (m === 'instant'
+        ? 'Each position is sold whole the moment its buy lands.'
+        : m === 'even'
+          ? 'The first part is sold at once, the rest in equal slices over a short time.'
+          : 'The first part is sold at once, then a share of what is left each time.') +
+      '\nApplies to the next buys; positions already being sold in parts carry on.',
+    { reply_markup: { inline_keyboard: [dcaRow()] } }
+  );
+}
+
+function dcaRow() {
+  const m = getDcaMode ? getDcaMode() : 'instant';
+  return ['instant', 'even', 'left'].map((k) => ({ text: `${k === m ? '✅ ' : ''}${DCA_NAMES[k]}`, callback_data: `dca:${k}` }));
+}
 
 async function changePause(chatId, value) {
   if (!setPaused) {
@@ -386,6 +427,11 @@ async function handleCallback(query) {
     await handleStopCallback(query, chat, query.data);
     return;
   }
+  if (/^dca:/.test(query.data || '')) {
+    await answer(query, 'Selling mode changed');
+    await changeDca(chat.id, query.data.slice(4));
+    return;
+  }
   if (query.data === 'pause' || query.data === 'resume') {
     await answer(query, query.data === 'pause' ? 'Paused' : 'Resumed');
     await changePause(chat.id, query.data === 'pause');
@@ -443,7 +489,7 @@ async function sendPositionsList(chatId) {
   const positions = getActivePositions ? getActivePositions() : [];
   const status = isPaused() ? '⏸ Buying is PAUSED (exits still work).\n' : '';
   if (positions.length === 0) {
-    await send(chatId, `${status}No open positions.`, { reply_markup: { inline_keyboard: [[pauseButton()]] } });
+    await send(chatId, `${status}No open positions.`, { reply_markup: { inline_keyboard: [[pauseButton()], ...(getDcaMode ? [dcaRow()] : [])] } });
     return;
   }
   // Details go in the message text (numbered); each position gets one row
@@ -466,6 +512,7 @@ async function sendPositionsList(chatId) {
     }
     return row;
   });
+  if (getDcaMode) keyboard.push(dcaRow());
   keyboard.push([pauseButton(), { text: '🔴 Close all positions', callback_data: 'closeallask' }]);
   await send(chatId, `${status}${positions.length} open position(s):\n${lines.join('\n')}`, {
     reply_markup: { inline_keyboard: keyboard }

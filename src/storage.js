@@ -282,6 +282,18 @@ function setPaused(paused) {
   writeData(data);
 }
 
+/** The DCA_SELLING mode chosen in Telegram ('instant' | 'even' | 'left'), or null if none was. Survives restarts. */
+function getDcaMode() {
+  const m = load().dcaMode;
+  return m === 'instant' || m === 'even' || m === 'left' ? m : null;
+}
+
+function setDcaMode(mode) {
+  const data = load();
+  data.dcaMode = mode;
+  writeData(data);
+}
+
 // ---- buys sent but not yet recorded as positions ----
 // If the bot stops between sending a buy and saving its position, the tokens
 // are in the wallet with nothing tracking them. Each sent buy is noted here
@@ -335,6 +347,8 @@ module.exports = {
   initStorage,
   getPaused,
   setPaused,
+  getDcaMode,
+  setDcaMode,
   getExitedMints,
   addExitedMint,
   addPosition,

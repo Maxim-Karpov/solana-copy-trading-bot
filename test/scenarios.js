@@ -1779,6 +1779,95 @@ module.exports = {
     }
   },
 
+  dca_even_sells_in_equal_slices: {
+    env: { TRADE_TYPE: 'STIERED', TIER_BUY_CONFIG: TIERS, INSTANT_SELL: 'true', DCA_SELLING: 'DCA_even', DCA_SLICES: '4', DCA_SECONDS: '2', DCA_FIRST_PCT: '25' },
+    async run(h) {
+      const m = h.newMint();
+      h.ledger.prices.set(m, 0.001);
+      h.buy(m, 1.0);
+      const closed = await h.waitFor(() => h.byMint(m).find((p) => p.status === 'closed'), 'position closed after the slices', 12000);
+      const sells = h.ledger.calls.sell.filter((c) => c.mint === m);
+      h.check(sells.length === 5, `first part + 4 slices (${sells.length} sells)`);
+      h.check(!sells[0].cheap && sells.slice(1).every((c) => c.cheap === true), 'the first part is the usual fast sell, the slices go the cheap way');
+      const amounts = sells.map((c) => Number(c.amountTokens));
+      const total = amounts.reduce((a, b) => a + b, 0);
+      h.check(Math.abs(amounts[0] / total - 0.25) < 0.001, `first part 25% (${(amounts[0] / total * 100).toFixed(2)}%)`);
+      h.check(amounts.slice(1).every((a) => Math.abs(a / total - 0.1875) < 0.001), `equal slices of the rest (${amounts.slice(1).map((a) => (a / total * 100).toFixed(2)).join(', ')}%)`);
+      const gaps = sells.slice(2).map((c, i) => c.at - sells[i + 1].at);
+      h.check(gaps.every((g) => g > 300 && g < 900), `slices spread evenly, about 500 ms apart (${gaps.join(', ')} ms)`);
+      h.check((h.ledger.tokens.get(m) || 0n) === 0n, `everything sold (${h.ledger.tokens.get(m)} left)`);
+      h.check(typeof closed.realized_pnl_sol === 'number', 'PnL recorded');
+      h.check(!closed.dca, 'no leftover DCA state');
+    }
+  },
+
+  dca_left_sells_a_share_of_what_is_left: {
+    env: { TRADE_TYPE: 'STIERED', TIER_BUY_CONFIG: TIERS, INSTANT_SELL: 'true', DCA_SELLING: 'DCA_left', DCA_SLICES: '3', DCA_SECONDS: '1', DCA_FIRST_PCT: '25', DCA_LEFT_PCT: '25' },
+    async run(h) {
+      const m = h.newMint();
+      h.ledger.prices.set(m, 0.001);
+      h.buy(m, 1.0);
+      await h.waitFor(() => h.byMint(m).find((p) => p.status === 'closed'), 'position closed after the slices', 12000);
+      const sells = h.ledger.calls.sell.filter((c) => c.mint === m);
+      const a = sells.map((c) => Number(c.amountTokens));
+      const total = a.reduce((x, y) => x + y, 0);
+      const pct = a.map((x) => (x / total) * 100);
+      // 25%, then 25% of the remaining 75% = 18.75%, then 25% of 56.25% = 14.06%, then the rest (42.19%).
+      h.check(sells.length === 4, `first part + 3 slices (${sells.length})`);
+      h.check(Math.abs(pct[0] - 25) < 0.01 && Math.abs(pct[1] - 18.75) < 0.01 && Math.abs(pct[2] - 14.0625) < 0.01, `shares (${pct.map((x) => x.toFixed(2)).join(', ')}%)`);
+      h.check(Math.abs(pct[3] - 42.1875) < 0.05, `the last slice takes what is left (${pct[3].toFixed(2)}%)`);
+      h.check((h.ledger.tokens.get(m) || 0n) === 0n, 'nothing left behind');
+    }
+  },
+
+  dca_stops_and_sells_the_rest_when_the_copy_wallet_sells: {
+    env: { TRADE_TYPE: 'STIERED', TIER_BUY_CONFIG: TIERS, INSTANT_SELL: 'true', DCA_SELLING: 'DCA_even', DCA_SLICES: '9', DCA_SECONDS: '9', DCA_FIRST_PCT: '25' },
+    async run(h) {
+      const m = h.newMint();
+      h.ledger.prices.set(m, 0.001);
+      h.buy(m, 1.0);
+      await h.waitFor(() => h.ledger.calls.sell.filter((c) => c.mint === m).length >= 2, 'first slice sent', 8000);
+      h.sell(m, 100);
+      const closed = await h.waitFor(() => h.byMint(m).find((p) => p.status === 'closed'), 'closed after the copy wallet sold', 8000);
+      const sells = h.ledger.calls.sell.filter((c) => c.mint === m);
+      const last = sells[sells.length - 1];
+      h.check(!last.cheap, 'the rest went the usual fast way');
+      h.check(/copy-sell/.test(closed.close_reason), `close reason (${closed.close_reason})`);
+      h.check(sells.length < 8, `the remaining slices never went out (${sells.length} sells)`);
+      await h.sleep(1500);
+      h.check(h.ledger.calls.sell.filter((c) => c.mint === m).length === sells.length, 'nothing sent after the exit');
+      h.check((h.ledger.tokens.get(m) || 0n) === 0n, 'everything sold');
+    }
+  },
+
+  dca_slice_that_fails_hands_over_to_one_normal_sell: {
+    env: { TRADE_TYPE: 'STIERED', TIER_BUY_CONFIG: TIERS, INSTANT_SELL: 'true', DCA_SELLING: 'DCA_even', DCA_SLICES: '3', DCA_SECONDS: '1', DCA_FIRST_PCT: '25' },
+    async run(h) {
+      const m = h.newMint();
+      h.ledger.prices.set(m, 0.001);
+      h.ledger.sellQueue.push('ok'); // the first part
+      h.ledger.sellQueue.push('failOnChain'); // the first slice
+      h.buy(m, 1.0);
+      const closed = await h.waitFor(() => h.byMint(m).find((p) => p.status === 'closed'), 'position closed', 12000);
+      const sells = h.ledger.calls.sell.filter((c) => c.mint === m);
+      h.check(sells.length === 3, `first part, the failed slice, then one sell of the rest (${sells.length})`);
+      h.check(sells[1].cheap === true && !sells[2].cheap, 'the rest went the usual way');
+      h.check((h.ledger.tokens.get(m) || 0n) === 0n, 'everything sold');
+      h.check(/DCA/.test(closed.close_reason), `close reason (${closed.close_reason})`);
+    }
+  },
+
+  dca_off_by_default_sells_the_whole_position_at_once: {
+    env: { TRADE_TYPE: 'STIERED', TIER_BUY_CONFIG: TIERS, INSTANT_SELL: 'true' },
+    async run(h) {
+      const m = h.newMint();
+      h.ledger.prices.set(m, 0.001);
+      h.buy(m, 1.0);
+      await h.waitFor(() => h.byMint(m).find((p) => p.status === 'closed'), 'position closed', 8000);
+      h.check(h.ledger.calls.sell.filter((c) => c.mint === m).length === 1, 'one sell');
+    }
+  },
+
   shred_buy_whose_original_failed_is_sold: {
     env: { TELEGRAM_BOT_TOKEN: 'test-token', TELEGRAM_CHAT_ID: '777', TRADE_TYPE: 'STIERED', TIER_BUY_CONFIG: TIERS },
     async run(h) {
