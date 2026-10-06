@@ -1851,9 +1851,24 @@ module.exports = {
       const closed = await h.waitFor(() => h.byMint(m).find((p) => p.status === 'closed'), 'position closed', 12000);
       const sells = h.ledger.calls.sell.filter((c) => c.mint === m);
       h.check(sells.length === 3, `first part, the failed slice, then one sell of the rest (${sells.length})`);
-      h.check(sells[1].cheap === true && !sells[2].cheap, 'the rest went the usual way');
+      h.check(sells[1].cheap === true && sells[2].cheap === true, 'the rest went the cheap way too');
       h.check((h.ledger.tokens.get(m) || 0n) === 0n, 'everything sold');
       h.check(/DCA/.test(closed.close_reason), `close reason (${closed.close_reason})`);
+    }
+  },
+
+  dca_failed_cheap_sell_of_the_rest_is_retried_the_usual_way: {
+    env: { TRADE_TYPE: 'STIERED', TIER_BUY_CONFIG: TIERS, INSTANT_SELL: 'true', DCA_SELLING: 'DCA_even', DCA_SLICES: '3', DCA_SECONDS: '1', DCA_FIRST_PCT: '25' },
+    async run(h) {
+      const m = h.newMint();
+      h.ledger.prices.set(m, 0.001);
+      h.ledger.sellQueue.push('ok', 'failOnChain', 'failOnChain'); // first part ok; first slice fails; the cheap sell of the rest fails
+      h.buy(m, 1.0);
+      await h.waitFor(() => h.byMint(m).find((p) => p.status === 'closed'), 'position closed', 15000);
+      const sells = h.ledger.calls.sell.filter((c) => c.mint === m);
+      h.check(sells.length === 4, `first part, failed slice, failed cheap rest, then a retry (${sells.length})`);
+      h.check(sells[2].cheap === true && !sells[3].cheap, 'the retry went the usual fast way');
+      h.check((h.ledger.tokens.get(m) || 0n) === 0n, 'everything sold');
     }
   },
 

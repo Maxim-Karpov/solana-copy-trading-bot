@@ -1530,8 +1530,14 @@ process.on('uncaughtException', (err) => {
         }
         const reason = run.reason || 'DCA (a slice failed): selling the rest';
         if (failed) persist(live, { needs_reconcile: true }); // a slice that did not confirm may still land: read the balance first
-        info(`[Main] DCA_SELLING: ${reason}; selling the rest of ${shortId(id)} now.`);
-        closeOrRemember(live, reason);
+        if (failed && !run.cancelled && !isBusy(live.id)) {
+          // A slice failed: the rest goes at once the cheap way too (Jito, DCA_TIP); only a retry of that sell goes the usual fast way.
+          info(`[Main] DCA_SELLING: ${reason}; selling the rest of ${shortId(id)} now, the cheap way.`);
+          requestClose(live, reason, { persistIntent: true, sell: { cheap: true, confirmSec: config.DCA_CONFIRM_SEC } });
+        } else {
+          info(`[Main] DCA_SELLING: ${reason}; selling the rest of ${shortId(id)} now.`);
+          closeOrRemember(live, reason);
+        }
       } finally {
         finish();
       }
