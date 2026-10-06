@@ -3572,6 +3572,15 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     // Never above the ceiling; off when switched off.
     ['c1', 'c2', 'c3'].forEach((sig) => { cb.remember(sig, kind, 300000); cb.observe(sig, 299000); });
     check(cb.fit(make(16), 'buy', fee).limit === 300000, 'never above the transaction\'s own limit');
+    // A tighter margin (COMPUTE_MARGIN_PCT / COMPUTE_MARGIN_UNITS): a lower limit, so more fee per unit.
+    const savedPct = cfg.COMPUTE_MARGIN_PCT, savedUnits = cfg.COMPUTE_MARGIN_UNITS;
+    cb._resetForTests();
+    ['m1', 'm2', 'm3'].forEach((sig) => { cb.remember(sig, kind, 300000); cb.observe(sig, 75140); });
+    cfg.COMPUTE_MARGIN_PCT = 1; cfg.COMPUTE_MARGIN_UNITS = 300;
+    const tight = cb.fit(make(16), 'buy', fee).limit;
+    cfg.COMPUTE_MARGIN_PCT = savedPct; cfg.COMPUTE_MARGIN_UNITS = savedUnits;
+    const loose = cb.fit(make(16), 'buy', fee).limit;
+    check(tight === Math.ceil(75140 * 1.01) + 300 && loose === Math.ceil(75140 * 1.1) + 3000 && tight < loose, `margin settings: tight ${tight}, default ${loose}`);
     const saved = cfg.AUTO_COMPUTE_UNITS;
     cfg.AUTO_COMPUTE_UNITS = false;
     cb._resetForTests();

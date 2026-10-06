@@ -31,8 +31,10 @@ const PUMP = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const PUMP_AMM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
 const MIN_SAMPLES = 3;
 const KEEP = 30; // recent trades remembered per kind
-const MARGIN = 1.1; // +10%
-const MARGIN_UNITS = 3000; // and a little more for small trades
+// The margin over the most a kind of trade has used: COMPUTE_MARGIN_PCT (default 10) and
+// COMPUTE_MARGIN_UNITS (default 3000, a little more for small trades).
+const marginPct = () => (Number.isFinite(config.COMPUTE_MARGIN_PCT) ? config.COMPUTE_MARGIN_PCT : 10);
+const marginUnits = () => (Number.isFinite(config.COMPUTE_MARGIN_UNITS) ? config.COMPUTE_MARGIN_UNITS : 3000);
 const FLOOR = 20_000;
 
 let kinds = null; // key -> { used: number[] }
@@ -87,7 +89,7 @@ function estimate(key, ceiling) {
   const k = kinds.get(key);
   if (!k || k.used.length < MIN_SAMPLES) return null;
   const most = Math.max(...k.used);
-  return Math.max(FLOOR, Math.min(ceiling, Math.ceil(most * MARGIN) + MARGIN_UNITS));
+  return Math.max(FLOOR, Math.min(ceiling, Math.ceil(most * (1 + marginPct() / 100)) + marginUnits()));
 }
 
 /**

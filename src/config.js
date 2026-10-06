@@ -459,6 +459,9 @@ config.PUMPFUN_COMPUTE_UNITS = numEnv('PUMPFUN_COMPUTE_UNITS', { def: 300_000, m
 // Size each trade's compute-unit limit to what that kind of trade has been
 // using (PUMPFUN_COMPUTE_UNITS is then the ceiling). "false" = always the full limit.
 config.AUTO_COMPUTE_UNITS = (process.env.AUTO_COMPUTE_UNITS || '').trim() !== 'false';
+// How far above the most a kind of trade has used its learned limit is set (see computeBudget.js).
+config.COMPUTE_MARGIN_PCT = numEnv('COMPUTE_MARGIN_PCT', { def: 10, min: 0, max: 100 });
+config.COMPUTE_MARGIN_UNITS = numEnv('COMPUTE_MARGIN_UNITS', { def: 3000, min: 0, max: 100_000, integer: true });
 config.PRIORITY_FEE_SOL = numEnv('PRIORITY_FEE_SOL', { def: config.SEND_VIA === 'sender' ? 0.0001 : 0, min: 0 });
 if (config.SEND_VIA === 'sender' && !(config.PRIORITY_FEE_SOL > 0)) {
   fail('SEND_VIA="sender" requires PRIORITY_FEE_SOL greater than 0 (Helius Sender rejects transactions without a priority fee).');
