@@ -7,7 +7,7 @@
 ![Node.js](https://img.shields.io/badge/node-%E2%89%A518.17-339933?logo=node.js&logoColor=white)
 ![Solana](https://img.shields.io/badge/Solana-mainnet-9945FF?logo=solana&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-176%20passing-2ea44f)
-![Version](https://img.shields.io/badge/version-3.33.1-blue)
+![Version](https://img.shields.io/badge/version-3.33.2-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Speed](#-built-for-speed) · [Rust fast path](#-rust-fast-path) · [Telegram](#-telegram-control) · [Full reference](docs/REFERENCE.md)
@@ -71,6 +71,7 @@ nano .env               # RPC, wallet, copy wallets, mode, limits
 # 3. Check and run
 npm run check-env       # missing or misspelt settings (never prints values)
 npm run check-site -- <page> <coin address>   # does a coin's web page show its address? (safety filters + page check)
+npm run vps-bench       # how fast is this server for the bot? (CPU, and the round trip to Sender and your RPC)
 npm test                # 176 tests, fully simulated, no network or funds
 npm start
 ```
@@ -219,7 +220,7 @@ src/
 ├── telegramBot.js      Telegram control and notifications
 └── storage.js          positions on disk
 fastpath/               the Rust fast path (cargo build --release)
-scripts/                check-env · check-site · leaders · shreder-check
+scripts/                check-env · check-site · vps-bench · leaders · shreder-check
 test/                   unit + end-to-end tests (network simulated)
 docs/REFERENCE.md       every setting and feature in detail
 ```

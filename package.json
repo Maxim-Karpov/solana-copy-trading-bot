@@ -1,6 +1,6 @@
 {
   "name": "solana-copy-trading-bot",
-  "version": "3.33.1",
+  "version": "3.33.2",
   "description": "A Solana copy trading bot that mirrors buys and sells from a specified wallet",
   "author": "AHK780",
   "license": "MIT",
@@ -11,7 +11,8 @@
     "check-env": "node scripts/check-env.js",
     "leaders": "node scripts/leaders.js",
     "shreder-check": "node scripts/shreder-check.js",
-    "check-site": "node scripts/check-site.js"
+    "check-site": "node scripts/check-site.js",
+    "vps-bench": "node scripts/vps-bench.js"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.14.5",
