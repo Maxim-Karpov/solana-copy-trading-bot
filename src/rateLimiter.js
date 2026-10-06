@@ -45,11 +45,23 @@ function createLimiter(maxPerSecond) {
     });
   }
 
+  /**
+   * A call on the trading path that goes out at once without waiting (the
+   * direct builders' reads): it still uses up a slot, so waiting background
+   * calls yield to it and the total stays under the limit. The push is
+   * capped so a burst of these can't starve the queue for more than a second.
+   */
+  function noteImmediate() {
+    if (unlimited) return;
+    const now = Date.now();
+    nextAt = Math.min(Math.max(now, nextAt) + gapMs, now + 1000);
+  }
+
   function pending() {
     return queues.high.length + queues.low.length;
   }
 
-  return { acquire, pending };
+  return { acquire, pending, noteImmediate };
 }
 
 module.exports = { createLimiter };

@@ -2277,7 +2277,7 @@ process.on('uncaughtException', (err) => {
 
         const coinSnapshot = pricePromise.then((pd) => coinInfo.snapshot({ mint, pumpEvent, priceData: pd })).then((snap) => {
           const lines = coinInfo.describe(snap);
-          if (lines.length) info(`[Main] ${mint}: ${lines.join(' | ')}`);
+          if (lines.length) info(`[Main] ${mint}: ${lines.join(' | ').replace(/\n/g, ' ')}`);
           return snap;
         });
         // Paid from a QUOTE_TOKENS reserve: remember which token (sells pay out in it).

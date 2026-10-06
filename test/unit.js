@@ -3095,6 +3095,95 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     check(out.nonSol && out.nonSol.unsupported && /not paired with SOL/.test(out.nonSol.msg), `non-SOL PumpSwap pool -> clear fallback (${JSON.stringify(out.nonSol)})`);
   });
 
+  await test('trading-path calls that skip the queue still use up limiter slots', async () => {
+    const { createLimiter } = require(src('rateLimiter.js'));
+    const lim = createLimiter(10); // 100 ms apart
+    lim.noteImmediate(); lim.noteImmediate(); // two direct reads went out at once
+    const t0 = Date.now();
+    await lim.acquire('low');
+    const waited = Date.now() - t0;
+    check(waited >= 150, `background call waits behind them (${waited} ms)`);
+    for (let i = 0; i < 50; i++) lim.noteImmediate();
+    const t1 = Date.now();
+    await lim.acquire('high');
+    check(Date.now() - t1 <= 1200, 'a burst cannot starve the queue for more than ~1 s');
+    const free = createLimiter(0); free.noteImmediate();
+    const t2 = Date.now(); await free.acquire(); check(Date.now() - t2 < 20, 'unlimited stays unlimited');
+  });
+
+  await test('coin links: read from the metadata file, creator-chosen URLs treated as hostile', async () => {
+    const L = require(src('coinLinks.js'));
+    const str = (v) => { const b = Buffer.from(v); const l = Buffer.alloc(4); l.writeUInt32LE(b.length); return Buffer.concat([l, b]); };
+    const meta = (uri) => ({ data: Buffer.concat([Buffer.alloc(65), str('Name'), str('SYM'), str(uri)]) });
+    check(L.parseUri(meta('https://ipfs.io/ipfs/abc').data) === 'https://ipfs.io/ipfs/abc', 'uri parsed from the metadata account');
+    const pub = async () => [{ address: '93.184.216.34' }];
+    check(await L.safeToFetch('https://ipfs.io/x', pub), 'normal https host allowed');
+    for (const bad of ['http://ipfs.io/x', 'https://169.254.169.254/latest', 'https://localhost/x', 'https://intranet/x', 'https://a.internal/x', 'https://user:pw@ipfs.io/x', 'https://ipfs.io:8443/x', 'https://[::1]/x', 'file:///etc/passwd']) {
+      check(!(await L.safeToFetch(bad, pub)), `refused ${bad}`);
+    }
+    check(!(await L.safeToFetch('https://evil.example/x', async () => [{ address: '10.0.0.5' }])), 'host resolving to a private address refused');
+    check(!(await L.safeToFetch('https://evil.example/x', async () => [{ address: '93.184.216.34' }, { address: '127.0.0.1' }])), 'any private answer refused');
+    check(L.cleanLink('javascript:alert(1)') === null && L.cleanLink('https://t.me/abc') === 'https://t.me/abc' && L.cleanLink('https://x.com/a\nb c') === 'https://x.com/ab' + 'c', 'only http(s) links kept, whitespace stripped');
+    const mint = Keypair.generate().publicKey.toBase58();
+    let fetched = null;
+    const json = { website: 'https://coin.example', twitter: 'https://x.com/coin', telegram: 'javascript:bad' };
+    const got = await L.readLinks(mint, { getInfo: async () => meta('https://ipfs.io/ipfs/abc'), lookup: pub, fetchImpl: async (u, o) => { fetched = o; return { ok: true, text: async () => JSON.stringify(json) }; } });
+    check(got && got.website === 'https://coin.example' && got.twitter === 'https://x.com/coin' && got.telegram === null, `links read (${JSON.stringify(got)})`);
+    check(fetched && fetched.redirect === 'manual', 'redirects not followed');
+    check((await L.readLinks(mint, { getInfo: async () => meta('http://10.0.0.1/x'), lookup: pub, fetchImpl: async () => { throw new Error('must not fetch'); } })) === null, 'unsafe uri never fetched');
+    check((await L.readLinks(mint, { getInfo: async () => null })) === null, 'no metadata account -> nothing');
+    const ci = require(src('coinInfo.js'));
+    const lines = ci.describe({ mcapUsd: null, mcapSol: null, curvePct: null, creatorPct: null, top10Pct: null, taxPct: null, links: got });
+    check(lines.length === 1 && /unverified/.test(lines[0]) && /Web: https:\/\/coin\.example/.test(lines[0]) && /X: https:\/\/x\.com\/coin/.test(lines[0]), 'shown in the buy message, labelled unverified');
+  });
+
+  await test('PumpSwap state is read in one round trip and equals the SDK\'s own three-step read', async () => {
+    const sdk = require('@pump-fun/pump-swap-sdk');
+    const spl = require('@solana/spl-token');
+    const { fastPoolState } = require(src('pumpswapDirect.js'));
+    const S = sdk.PUMP_AMM_SDK;
+    const co = S.offlineProgram.coder.accounts;
+    const blank = (n) => { const b = Buffer.alloc(S.offlineProgram.account[n].size); Buffer.from(co.accountDiscriminator(n)).copy(b); return b; };
+    const acc = (owner, data) => ({ owner, data, lamports: 1, executable: false });
+    const tokAcc = (m, o, amt) => { const b = Buffer.alloc(165); spl.AccountLayout.encode({ mint: m, owner: o, amount: BigInt(amt), delegateOption: 0, delegate: PublicKey.default, state: 1, isNativeOption: 0, isNative: 0n, delegatedAmount: 0n, closeAuthorityOption: 0, closeAuthority: PublicKey.default }, b); return b; };
+    const mb = Buffer.alloc(82);
+    spl.MintLayout.encode({ mintAuthorityOption: 0, mintAuthority: PublicKey.default, supply: 1000000000000000n, decimals: 6, isInitialized: true, freezeAuthorityOption: 0, freezeAuthority: PublicKey.default }, mb);
+    for (const t22 of [false, true]) {
+      const prog = t22 ? spl.TOKEN_2022_PROGRAM_ID : spl.TOKEN_PROGRAM_ID;
+      const mint = Keypair.generate().publicKey;
+      const user = Keypair.generate().publicKey;
+      const poolKey = sdk.canonicalPumpPoolPda(mint);
+      const ata = (m, o, p) => spl.getAssociatedTokenAddressSync(m, o, true, p);
+      const pool = co.decode('pool', blank('pool'));
+      Object.assign(pool, { baseMint: mint, quoteMint: spl.NATIVE_MINT, poolBaseTokenAccount: ata(mint, poolKey, prog), poolQuoteTokenAccount: ata(spl.NATIVE_MINT, poolKey, spl.TOKEN_PROGRAM_ID), coinCreator: Keypair.generate().publicKey, creator: Keypair.generate().publicKey });
+      const gc = co.decode('globalConfig', blank('globalConfig'));
+      const rows = [
+        [sdk.GLOBAL_CONFIG_PDA, acc(sdk.PUMP_AMM_PROGRAM_ID, await co.encode('globalConfig', gc))],
+        [poolKey, acc(sdk.PUMP_AMM_PROGRAM_ID, await co.encode('pool', pool))],
+        [mint, acc(prog, mb)],
+        [pool.poolBaseTokenAccount, acc(prog, tokAcc(mint, poolKey, 5e14))],
+        [pool.poolQuoteTokenAccount, acc(spl.TOKEN_PROGRAM_ID, tokAcc(spl.NATIVE_MINT, poolKey, 9e10))],
+        [spl.NATIVE_MINT, acc(spl.TOKEN_PROGRAM_ID, Buffer.alloc(82))]
+      ];
+      const db = new Map(rows.map(([k, v]) => [k.toBase58(), v]));
+      let calls = 0;
+      const conn = { getMultipleAccountsInfo: async (ks) => { calls += 1; return ks.map((k) => db.get(k.toBase58()) || null); } };
+      const slow = await new sdk.OnlinePumpAmmSdk(conn).swapSolanaState(poolKey, user);
+      const slowCalls = calls; calls = 0;
+      const fast = await fastPoolState(conn, user, mint.toBase58());
+      const norm = (o) => JSON.stringify(o, (k, v) => (v && v.type === 'Buffer' ? undefined : typeof v === 'bigint' ? v.toString() : v));
+      const bad = Object.keys(slow).filter((k) => norm(slow[k]) !== norm(fast[k]));
+      check(slowCalls === 3 && calls === 1, `${t22 ? 'Token-2022' : 'Token'}: 3 calls -> 1 (${slowCalls} -> ${calls})`);
+      check(bad.length === 0 && Object.keys(fast).length === Object.keys(slow).length, `${t22 ? 'Token-2022' : 'Token'}: same state as the SDK's (differs: ${bad})`);
+      // A pool whose vault isn't the standard account is refused here (the caller then uses the SDK's read).
+      pool.poolBaseTokenAccount = Keypair.generate().publicKey;
+      db.set(poolKey.toBase58(), acc(sdk.PUMP_AMM_PROGRAM_ID, await co.encode('pool', pool)));
+      let threw = false;
+      try { await fastPoolState(conn, user, mint.toBase58()); } catch { threw = true; }
+      check(threw, 'non-standard pool vault -> falls back');
+    }
+  });
+
   await test('fees, tips and token-account deposits are measured separately from the swap', async () => {
     const { measureWalletDeltas } = require(src('txParser.js'));
     const W = Keypair.generate().publicKey.toBase58();

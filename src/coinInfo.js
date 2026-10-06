@@ -23,6 +23,7 @@ const rpcPool = require('./rpcPool');
 const { getSolUsd } = require('./priceChecker');
 const { withTimeout } = require('./timeouts');
 const tokenTax = require('./tokenTax');
+const coinLinks = require('./coinLinks');
 const { warn } = require('./logger');
 
 // Standard Pump.fun coins: 1,000,000,000 tokens (6 decimals), of which
@@ -107,7 +108,7 @@ async function holderStats(mint, creator) {
  * @returns { mcapUsd, mcapSol, curvePct, creatorPct, top10Pct }
  */
 async function snapshot({ mint, pumpEvent = null, priceData = null }) {
-  const out = { mcapUsd: null, mcapSol: null, curvePct: null, creatorPct: null, top10Pct: null, taxPct: null };
+  const out = { mcapUsd: null, mcapSol: null, curvePct: null, creatorPct: null, top10Pct: null, taxPct: null, links: null };
   const work = (async () => {
     const holdersP = holderStats(mint, pumpEvent && pumpEvent.creator).catch((err) => {
       warn(`[coinInfo] Holder lookup for ${mint} failed: ${err.message}`);
@@ -115,6 +116,7 @@ async function snapshot({ mint, pumpEvent = null, priceData = null }) {
     });
     const solUsdP = pumpEvent ? getSolUsd().catch(() => null) : Promise.resolve(null);
     // Transfer tax: usually already looked up before the buy (cached).
+    const linksP = coinLinks.readLinks(mint).catch(() => null);
     const taxP = tokenTax.getTransferFeePct(mint, { priority: 'low' }).catch(() => null);
 
     // Market cap / curve from our own trade: ready at once (assuming the
@@ -138,6 +140,7 @@ async function snapshot({ mint, pumpEvent = null, priceData = null }) {
       applyCurve(holders.supplyRaw, solUsd);
     }
     out.taxPct = await taxP;
+    out.links = await linksP;
   })();
   work.catch(() => {}); // if it finishes after the timeout, nobody's listening
   try {
@@ -174,6 +177,11 @@ function describe(snap) {
   if (snap.creatorPct !== null) second.push(`Creator holds ${fmtPct(snap.creatorPct)}`);
   if (snap.top10Pct !== null) second.push(`Top 10: ${fmtPct(snap.top10Pct)}`);
   if (second.length) lines.push(second.join(' · '));
+  if (snap.links) {
+    const l = snap.links;
+    const found = [l.website && `Web: ${l.website}`, l.twitter && `X: ${l.twitter}`, l.telegram && `TG: ${l.telegram}`].filter(Boolean);
+    lines.push(found.length ? `Links (set by the creator, unverified):\n${found.join('\n')}` : 'Links: none filed (no website, X or Telegram)');
+  }
   if (snap.taxPct > 0) lines.push(`⚠️ Tax: ${fmtPct(snap.taxPct)} on every buy/sell (transfer fee)`);
   return lines;
 }

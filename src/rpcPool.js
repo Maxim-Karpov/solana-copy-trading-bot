@@ -49,18 +49,19 @@ function current() {
 
 /** The live Connection for whichever endpoint is currently active. */
 /** Count every HTTP request a connection makes, by method, for the [Usage] log line. */
-function countRequests(conn) {
+function countRequests(conn, { immediate = false } = {}) {
   if (typeof conn._rpcRequest === 'function') {
     const orig = conn._rpcRequest;
     conn._rpcRequest = function (method, args) {
       usageStats.countRpc(method);
+      if (immediate) limiter.noteImmediate();
       return orig.call(this, method, args);
     };
   }
   if (typeof conn._rpcBatchRequest === 'function') {
     const origBatch = conn._rpcBatchRequest;
     conn._rpcBatchRequest = function (requests) {
-      for (const r of requests || []) usageStats.countRpc(r && r.methodName ? r.methodName : 'batch');
+      for (const r of requests || []) { usageStats.countRpc(r && r.methodName ? r.methodName : 'batch'); if (immediate) limiter.noteImmediate(); }
       return origBatch.call(this, requests);
     };
   }
@@ -81,7 +82,7 @@ function getConnection(commitment = 'confirmed', index = currentIndex) {
     // the library would otherwise silently retry up to 5 times per call,
     // multiplying the load exactly when it's already too high. The bot's
     // own logic decides what's worth retrying.
-    ep.connections[commitment] = countRequests(new Connection(ep.httpUrl, { commitment, disableRetryOnRateLimit: true }));
+    ep.connections[commitment] = countRequests(new Connection(ep.httpUrl, { commitment, disableRetryOnRateLimit: true }), { immediate: commitment === 'processed' });
   }
   if (commitment === 'confirmed') ep.connection = ep.connections.confirmed;
   return ep.connections[commitment];
