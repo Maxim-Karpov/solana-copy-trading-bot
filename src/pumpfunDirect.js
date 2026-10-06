@@ -74,6 +74,7 @@ function parseMint(acc, key) {
   const data = Buffer.from(acc.data || []);
   if (data.length < 45) throw new UnsupportedPumpfunTradeError(`${key}: coin account is too short to be a token mint`);
   const details = { program, supply: new BN(data.readBigUInt64LE(36).toString()), decimals: data.readUInt8(44) };
+  if (program === TOKEN_2022_PROGRAM_ID) plainAccount.learnFromMint(key, acc); // TOKEN_ACCOUNT_MODE=plain: the account length this coin needs
   mintCache.set(key, details);
   return details;
 }

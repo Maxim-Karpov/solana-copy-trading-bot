@@ -46,7 +46,8 @@ const MAX_MARKERS = 3000;
 // different seeds (shifted by one character) so their accounts never clash.
 const SEED_SHIFT = { node: 0, rust: 1 };
 
-let t22Len = null; // Token-2022 token account length, learned from the wallet's own accounts
+let t22Len = null; // Token-2022 token account length, learned from the wallet's own accounts or a coin's mint
+let t22Mixed = false; // coins needing different lengths were seen: not guessed at
 let markers = null; // mint -> ms when a plain account was last made for it (this builder)
 
 const enabled = () => config.TOKEN_ACCOUNT_MODE === 'plain';
@@ -75,7 +76,7 @@ const lamportsFor = (len) => (RENT_BASE_BYTES + len) * RENT_PER_BYTE;
 function accountLen(program) {
   const p = Buffer.isBuffer(program) ? program : program.toBuffer();
   if (p.equals(TOKEN_PROGRAM_ID.toBuffer())) return CLASSIC_LEN;
-  if (p.equals(TOKEN_2022_PROGRAM_ID.toBuffer())) return t22Len || config.TOKEN_2022_ACCOUNT_BYTES || null;
+  if (p.equals(TOKEN_2022_PROGRAM_ID.toBuffer())) return config.TOKEN_2022_ACCOUNT_BYTES || (t22Mixed ? null : t22Len);
   return null;
 }
 
@@ -212,14 +213,49 @@ async function learnLength(connection, owner) {
       const len = a.account.data.length;
       if (len >= CLASSIC_LEN) counts.set(len, (counts.get(len) || 0) + 1);
     }
-    if (counts.size) {
-      t22Len = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
-      info(`[plainAccount] Token-2022 token accounts are ${t22Len} bytes: plain accounts will be used for Token-2022 coins too.`);
-    }
+    if (counts.size) noteT22Len([...counts.entries()].sort((a, b) => b[1] - a[1])[0][0], "from the wallet's own accounts");
   } catch (err) {
     warn(`[plainAccount] Couldn't read the wallet's Token-2022 accounts (${err.message}).`);
   }
   return t22Len;
+}
+
+/** Record a Token-2022 account length; two different ones switch Token-2022 plain accounts off (the ATA is used). */
+function noteT22Len(n, from) {
+  if (!t22Len) {
+    t22Len = n;
+    info(`[plainAccount] A Token-2022 token account for these coins is ${n} bytes (${from}): plain accounts will be used for Token-2022 coins too.`);
+  } else if (t22Len !== n && !t22Mixed) {
+    t22Mixed = true;
+    warn(`[plainAccount] Token-2022 coins need different account sizes (${t22Len} and ${n}): plain accounts are not used for them (set TOKEN_2022_ACCOUNT_BYTES to force one).`);
+  }
+}
+
+/** The length of the token account the ATA program would make for this Token-2022 mint (its extensions decide). */
+function lengthForMintAccount(address, accountInfo) {
+  const spl = require('@solana/spl-token');
+  const mint = spl.unpackMint(new PublicKey(address), accountInfo, TOKEN_2022_PROGRAM_ID);
+  // The mint's extensions (type, length, value entries), read here rather than with spl-token's helper, which is version-sensitive.
+  const tlv = Buffer.from(mint.tlvData);
+  const types = [];
+  for (let at = 0; at + 4 <= tlv.length; ) {
+    const type = tlv.readUInt16LE(at);
+    if (type === 0) break;
+    types.push(type);
+    at += 4 + tlv.readUInt16LE(at + 2);
+  }
+  const exts = types.map(spl.getAccountTypeOfMintType).filter((t) => t !== undefined && t !== spl.ExtensionType.Uninitialized);
+  return spl.getAccountLen([...exts, spl.ExtensionType.ImmutableOwner]);
+}
+
+/** Learn the length from a Token-2022 coin's mint (read anyway for trades): no wallet account needed. */
+function learnFromMint(address, accountInfo) {
+  if (!enabled()) return;
+  try {
+    noteT22Len(lengthForMintAccount(address, accountInfo), 'from the coin');
+  } catch {
+    // not readable: no guess
+  }
 }
 
 /** Start learning the length (now, then every few minutes until known). Plain mode only. */
@@ -304,6 +340,7 @@ function createAtaInstruction(user, mint, program) {
 
 function _resetForTests() {
   t22Len = null;
+  t22Mixed = false;
   markers = new Map();
 }
 function _setT22Len(n) {
@@ -325,6 +362,8 @@ module.exports = {
   plan,
   toWeb3,
   learnLength,
+  learnFromMint,
+  lengthForMintAccount,
   startLearning,
   holders,
   amountOf,

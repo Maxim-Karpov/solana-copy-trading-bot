@@ -61,10 +61,18 @@ async function main() {
   const is22 = program.toBase58().startsWith('Tokenz');
   console.log(`Coin ${mintPk.toBase58()}: ${is22 ? 'Token-2022' : 'classic SPL token'} coin, buying ${amount} SOL (simulated only).`);
 
-  if (is22) await plainAccount.learnLength(conn, user);
-  if (is22 && !plainAccount.accountLen(program)) {
-    console.log("The wallet has no Token-2022 token account yet, so the length of one isn't known and plain mode would use the usual account for these coins.");
-    console.log('Buy one Token-2022 coin the usual way first (or set TOKEN_2022_ACCOUNT_BYTES), then run this again.');
+  if (is22) {
+    // The length of the token account this coin needs: from the coin's own extensions (no wallet account needed).
+    const mintAcc = await conn.getAccountInfo(mintPk, 'confirmed');
+    try {
+      const len = plainAccount.lengthForMintAccount(mintPk, mintAcc);
+      console.log(`A Token-2022 token account for this coin is ${len} bytes (what the usual account makes).`);
+      config.TOKEN_ACCOUNT_MODE = 'plain';
+      plainAccount.learnFromMint(mintPk.toBase58(), mintAcc);
+      console.log('Check other Token-2022 coins too: if their size differs, plain mode skips Token-2022 coins by itself.');
+    } catch (err) {
+      console.log(`Couldn't work out the account size from the coin (${err.message}).`);
+    }
   }
 
   const curve = sdk.bondingCurvePda(mintPk);

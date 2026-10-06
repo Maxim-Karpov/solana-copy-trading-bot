@@ -1631,6 +1631,29 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
       const ref = spl.createTransferCheckedInstruction(want, mintPk, to, user, 123456789n, 6, [], program);
       check(Buffer.from(mv.data).equals(Buffer.from(ref.data)) && mv.keys.every((k, i) => k.pubkey.equals(ref.keys[i].pubkey) && k.isSigner === ref.keys[i].isSigner && k.isWritable === ref.keys[i].isWritable), 'a move is the same TransferChecked spl-token writes');
     }
+    // The length a Token-2022 coin needs, from its mint's extensions (what the ATA program would make)
+    const mintData = (exts) => {
+      const tlv = Buffer.concat(exts.map(([t, l]) => { const h = Buffer.alloc(4); h.writeUInt16LE(t, 0); h.writeUInt16LE(l, 2); return Buffer.concat([h, Buffer.alloc(l)]); }));
+      const b = Buffer.alloc(166 + tlv.length);
+      b.writeUInt8(1, 45); // initialised
+      b[165] = 1; // account type: mint
+      tlv.copy(b, 166);
+      return b;
+    };
+    const lenFor = (exts) => pa.lengthForMintAccount(Keypair.generate().publicKey, { owner: spl.TOKEN_2022_PROGRAM_ID, data: mintData(exts), lamports: 1, executable: false });
+    check(lenFor([[18, 64], [19, 100]]) === 170, `metadata-only Token-2022 coin: 170 bytes (${lenFor([[18, 64], [19, 100]])})`);
+    check(lenFor([[14, 64]]) > 170, `a transfer-hook coin needs the extra account extension (${lenFor([[14, 64]])})`);
+    pa._resetForTests();
+    pa.learnFromMint('x', null); // mode ata: ignored
+    check(pa.accountLen(spl.TOKEN_2022_PROGRAM_ID) === null, 'mode ata: nothing learned');
+    require(src('config.js')).TOKEN_ACCOUNT_MODE = 'plain';
+    pa.learnFromMint(Keypair.generate().publicKey.toBase58(), { owner: spl.TOKEN_2022_PROGRAM_ID, data: mintData([[18, 64]]), lamports: 1, executable: false });
+    check(pa.accountLen(spl.TOKEN_2022_PROGRAM_ID) === 170, 'learned from a coin: 170');
+    pa.learnFromMint(Keypair.generate().publicKey.toBase58(), { owner: spl.TOKEN_2022_PROGRAM_ID, data: mintData([[14, 64]]), lamports: 1, executable: false });
+    check(pa.accountLen(spl.TOKEN_2022_PROGRAM_ID) === null, 'two different sizes seen: Token-2022 plain accounts switched off');
+    require(src('config.js')).TOKEN_ACCOUNT_MODE = 'ata';
+    pa._resetForTests();
+    pa._setT22Len(170);
     // Plan: off by default, on with the mode, ATA again once bought, Token-2022 only once its length is known.
     const config = require(src('config.js'));
     const mintStr = Keypair.generate().publicKey.toBase58();
