@@ -3311,6 +3311,9 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     const yes = ci.describe({ ...base, links: { website: 'https://coin.example', twitter: null, telegram: null, siteMentions: 'page' } });
     const no = ci.describe({ ...base, links: { website: 'https://coin.example', twitter: null, telegram: null, siteMentions: false } });
     check(/shows this coin's address/.test(yes[0]) && /does NOT show/.test(no[0]), 'result shown in the buy message');
+    const unk = ci.describe({ ...base, links: { website: 'https://coin.example', twitter: null, telegram: null, siteMentions: null } });
+    const none = ci.describe({ ...base, links: { website: null, twitter: 'https://x.com/a', telegram: null } });
+    check(/could not be checked/.test(unk[0]) && /no website filed/.test(none[0]), 'unknown and no-website cases are stated too');
   });
 
   await test('PumpSwap state is read in one round trip and equals the SDK\'s own three-step read', async () => {

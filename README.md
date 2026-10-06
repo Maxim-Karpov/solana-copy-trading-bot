@@ -7,7 +7,7 @@
 ![Node.js](https://img.shields.io/badge/node-%E2%89%A518.17-339933?logo=node.js&logoColor=white)
 ![Solana](https://img.shields.io/badge/Solana-mainnet-9945FF?logo=solana&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-181%20passing-2ea44f)
-![Version](https://img.shields.io/badge/version-3.36.1-blue)
+![Version](https://img.shields.io/badge/version-3.36.2-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Trade modes](#-trade-modes) · [Speed](#-built-for-speed) · [Rust fast path](#-rust-fast-path) · [Telegram](#-telegram-control) · [Full reference](docs/REFERENCE.md)

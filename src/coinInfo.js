@@ -31,6 +31,7 @@ const { warn } = require('./logger');
 const PUMP_STANDARD_SUPPLY_RAW = 1_000_000_000n * 1_000_000n;
 const PUMP_CURVE_TOKENS_RAW = 793_100_000n * 1_000_000n;
 const SNAPSHOT_TIMEOUT_MS = 2500;
+const LINKS_TIMEOUT_MS = 4500; // the website check (metadata 1.5 s + site 2 s) may take until here; nothing else waits for it
 const LOW = { priority: 'low' }; // background lookups: trading calls go first
 
 /** Share as a percentage (number) of part/whole, both BigInt. */
@@ -109,21 +110,23 @@ async function holderStats(mint, creator) {
  */
 async function snapshot({ mint, pumpEvent = null, priceData = null }) {
   const out = { mcapUsd: null, mcapSol: null, curvePct: null, creatorPct: null, top10Pct: null, taxPct: null, links: null };
+  const started = Date.now();
+  // Shown as soon as the metadata is read; the website check is added when it's done.
+  const linksP = coinLinks.readLinks(mint).then((l) => {
+    out.links = l;
+    if (l && l.website) {
+      return coinLinks.siteMentions(l.website, mint).then((r) => { l.siteMentions = r; }, () => {}).then(() => l);
+    }
+    return l;
+  }).catch(() => null);
+  linksP.catch(() => {});
   const work = (async () => {
+    // Transfer tax: usually already looked up before the buy (cached).
     const holdersP = holderStats(mint, pumpEvent && pumpEvent.creator).catch((err) => {
       warn(`[coinInfo] Holder lookup for ${mint} failed: ${err.message}`);
       return null;
     });
     const solUsdP = pumpEvent ? getSolUsd().catch(() => null) : Promise.resolve(null);
-    // Transfer tax: usually already looked up before the buy (cached).
-    // Shown as soon as the metadata is read; the website check is added when it's done.
-    const linksP = coinLinks.readLinks(mint).then((l) => {
-      out.links = l;
-      if (l && l.website) {
-        return coinLinks.siteMentions(l.website, mint).then((r) => { l.siteMentions = r; }, () => {}).then(() => l);
-      }
-      return l;
-    }).catch(() => null);
     const taxP = tokenTax.getTransferFeePct(mint, { priority: 'low' }).catch(() => null);
 
     // Market cap / curve from our own trade: ready at once (assuming the
@@ -147,13 +150,20 @@ async function snapshot({ mint, pumpEvent = null, priceData = null }) {
       applyCurve(holders.supplyRaw, solUsd);
     }
     out.taxPct = await taxP;
-    await linksP;
   })();
   work.catch(() => {}); // if it finishes after the timeout, nobody's listening
   try {
     await withTimeout(work, SNAPSHOT_TIMEOUT_MS, 'Coin snapshot');
   } catch (err) {
     warn(`[coinInfo] ${err.message} for ${mint}; sending what's ready.`);
+  }
+  // The website check may take a little longer than the rest, but not past LINKS_TIMEOUT_MS.
+  const left = LINKS_TIMEOUT_MS - (Date.now() - started);
+  const pending = out.links && out.links.website && out.links.siteMentions === undefined;
+  if (pending && left > 0) {
+    let t;
+    await Promise.race([linksP, new Promise((r) => { t = setTimeout(r, left); })]);
+    clearTimeout(t);
   }
   return { ...out, links: out.links ? { ...out.links } : null }; // a copy: late results mustn't change what was already reported
 }
@@ -187,7 +197,7 @@ function describe(snap) {
   if (snap.links) {
     const l = snap.links;
     const found = [l.website && `Web: ${l.website}`, l.twitter && `X: ${l.twitter}`, l.telegram && `TG: ${l.telegram}`].filter(Boolean);
-    const site = l.siteMentions === 'link' ? "the website link is this coin's own address page" : l.siteMentions === 'page' ? "the website shows this coin's address ✅" : l.siteMentions === false ? "the website does NOT show this coin's address (scripted sites may still)" : null;
+    const site = l.siteMentions === 'link' ? "the website link is this coin's own address page" : l.siteMentions === 'page' ? "✅ the website shows this coin's address" : l.siteMentions === false ? "❌ the website does NOT show this coin's address (scripted sites may still)" : l.website ? 'the website could not be checked (slow, blocked or unreadable)' : '🌐 no website filed';
     lines.push(found.length ? `Links (set by the creator, unverified):\n${found.join('\n')}${site ? `\n${site}` : ''}` : 'Links: none filed (no website, X or Telegram)');
   }
   if (snap.taxPct > 0) lines.push(`⚠️ Tax: ${fmtPct(snap.taxPct)} on every buy/sell (transfer fee)`);
