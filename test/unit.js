@@ -1154,6 +1154,14 @@ const tb = (owner, mint, amount, decimals = 6) => ({ owner, mint, uiTokenAmount:
     const rpcPool = require(src('rpcPool.js'));
     const conn = rpcPool.getConnection();
     check(String(conn._rpcRequest).includes('countRpc'), 'every HTTP request of the shared connection is counted');
+    // Per wallet: who costs the credits
+    const A = 'AaaaWallet1111111111111111111111111111111111';
+    const B = 'BbbbWallet2222222222222222222222222222222222';
+    usage.countWallet(A, 600000, 'own'); usage.countWallet(A, 1400000, 'others'); usage.countWallet(A, 1000000, 'others');
+    usage.countWallet(B, 500000, 'own'); usage.countWallet(B, 100000, 'failed');
+    const byWallet = usage.walletSummary(usage._totals());
+    check(/^websocket by wallet: Aaaa…1111 3\.00 MB \(83%/.test(byWallet) && /1 signed by it, 2 signed by others/.test(byWallet), byWallet);
+    check(/Bbbb…2222 0\.60 MB \(17%/.test(byWallet) && /1 failed/.test(byWallet), byWallet);
   });
 
   await test('SolanaPortal error pages are summarised, not dumped', async () => {

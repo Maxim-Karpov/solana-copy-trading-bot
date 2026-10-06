@@ -38,6 +38,7 @@ const PROCESSED = config.DETECTION_COMMITMENT === 'processed';
 const PUMP_TOKEN_DECIMALS = 6;
 
 const PING_INTERVAL_MS = 30000;
+const COPY_WALLET_SET = new Set(config.COPY_WALLETS);
 const LOGS_ID_BASE = 100; // request ids of the per-wallet logsSubscribe calls
 const RECONNECT_DELAY_MS = 5000;
 const FIRST_RECONNECT_DELAY_MS = 500;
@@ -143,6 +144,8 @@ class CopyEmitter extends EventEmitter {
     // transactionSubscribe: whole transactions, failed ones filtered out by
     // Helius; Developer plan or higher). Falls back to 'logs' if refused.
     this.feed = config.DETECTION_FEED;
+    this._subWallet = new Map(); // logsSubscribe id -> copy wallet
+    this._msgBytes = 0;
     this.pingInterval = null;
     this.subscriptionId = null;
     // Small ring buffer so a duplicate notification (e.g. after a
@@ -248,7 +251,9 @@ class CopyEmitter extends EventEmitter {
     });
 
     ws.on('message', (data) => {
-      usageStats.countWs(data && data.length ? data.length : 0);
+      const bytes = data && data.length ? data.length : 0;
+      this._msgBytes = bytes; // for the per-wallet usage figures
+      usageStats.countWs(bytes);
       let msg;
       try {
         msg = JSON.parse(data.toString());
@@ -271,6 +276,7 @@ class CopyEmitter extends EventEmitter {
       const isSubId = msg.id === 1 || (typeof msg.id === 'number' && msg.id >= LOGS_ID_BASE);
       if (isSubId && typeof msg.result === 'number') {
         this.subscriptionId = msg.result;
+        if (msg.id >= LOGS_ID_BASE) this._subWallet.set(msg.result, config.COPY_WALLETS[msg.id - LOGS_ID_BASE]); // logs feed: which wallet a notification is for
         // Only a working subscription counts as a healthy endpoint (an
         // endpoint that accepts connections but rejects logsSubscribe should
         // still get rotated away from).
@@ -324,14 +330,18 @@ class CopyEmitter extends EventEmitter {
       if (!value) return;
 
       const { signature, err } = value;
+      const logWallet = this._subWallet.get(msg.params && msg.params.subscription);
       if (err) {
         usageStats.countWsKind('failed');
+        if (logWallet) usageStats.countWallet(logWallet, this._msgBytes, 'failed');
         return; // failed transaction on-chain, nothing to copy
       }
       if (this._markSeen(signature)) {
         usageStats.countWsKind('duplicate');
+        if (logWallet) usageStats.countWallet(logWallet, this._msgBytes, 'duplicate');
         return; // already processed (duplicate/replay)
       }
+      if (logWallet) usageStats.countWallet(logWallet, this._msgBytes, 'activity'); // logs don't say who signed it
       if (cannotBeTokenActivity(value.logs)) {
         usageStats.countSkipped();
         return; // e.g. a plain SOL transfer: nothing to copy, no lookup needed
@@ -584,12 +594,31 @@ class CopyEmitter extends EventEmitter {
     const signature = result && result.signature;
     const tx = result && result.transaction;
     if (!signature || !tx) return;
+    // Which copy wallet the data is for (the first one the transaction names).
+    let wallet = null;
+    try {
+      const keys = (tx.transaction && tx.transaction.message && tx.transaction.message.accountKeys) || [];
+      for (const k of keys) {
+        const a = typeof k === 'string' ? k : k && k.pubkey && String(k.pubkey);
+        if (a && COPY_WALLET_SET.has(a)) {
+          wallet = a;
+          break;
+        }
+      }
+    } catch {
+      // statistics only
+    }
+    const count = (kind) => {
+      if (wallet) usageStats.countWallet(wallet, this._msgBytes, kind);
+    };
     if (tx.meta && tx.meta.err) {
       usageStats.countWsKind('failed');
+      count('failed');
       return;
     }
     if (this._markSeen(signature)) {
       usageStats.countWsKind('duplicate');
+      count('duplicate');
       return;
     }
     let parsedTx;
@@ -606,8 +635,10 @@ class CopyEmitter extends EventEmitter {
     const signers = copySigners(parsedTx);
     if (!signers.length) {
       usageStats.countSkippedNoise();
+      count('others');
       return;
     }
+    count('own');
     this._processParsedTx(parsedTx, seenAt, signers);
   }
 
